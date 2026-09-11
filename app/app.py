@@ -86,8 +86,12 @@ def api_create():
         w, h = img.size
     finally:
         tmp.exists() and tmp.unlink()
-    pid = db.create_project(name, f"/images/{fname}", w, h,
-                            base_exposure=float(request.form.get("base_exposure") or 10))
+    pid = db.create_project(
+        name, f"/images/{fname}", w, h,
+        base_exposure=float(request.form.get("base_exposure") or 10),
+        magnification=float(request.form.get("magnification") or 1),
+        aperture=(request.form.get("aperture") or "f/8").strip() or "f/8",
+        paper_grade=int(request.form.get("paper_grade", 2)))
     return jsonify({"id": pid, "redirect": url_for("project_page", pid=pid)})
 
 
@@ -300,6 +304,7 @@ def print_sheet(pid):
                          "param": f"遮挡 {float(s.get('ratio',0))*100:.0f}%",
                          "feather": reg.get("feather", 0),
                          "size": reg.get("size", 0),
+                         "kind": reg.get("kind"),
                          "end": float(s.get("start", 0)) + dur})
         else:
             extra = base_exp * (2.0 ** float(s.get("stops", 0)) - 1.0)
@@ -310,6 +315,7 @@ def print_sheet(pid):
                          "param": f"+{s.get('stops',0):g} 档",
                          "feather": reg.get("feather", 0),
                          "size": reg.get("size", 0),
+                         "kind": reg.get("kind"),
                          "end": t0 + extra})
 
     return render_template(

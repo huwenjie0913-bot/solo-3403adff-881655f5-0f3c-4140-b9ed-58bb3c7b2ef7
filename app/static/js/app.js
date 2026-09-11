@@ -625,7 +625,7 @@ export class App {
         <div class="muted">在 ${(+s.start).toFixed(1)}s–${(+s.start+dur).toFixed(1)}s 挡住光线，
           等效减光约 ${(Math.log2(1/(1-s.ratio))).toFixed(2)} 档</div>`;
     } else {
-      const extra = base * (10 ** s.stops - 1);
+      const extra = base * (2 ** s.stops - 1);
       box.innerHTML = `
         <div class="kv">类型<span style="color:var(--burn)">加光（burn）</span></div>
         <div class="kv">区域<select class="e-region"></select></div>

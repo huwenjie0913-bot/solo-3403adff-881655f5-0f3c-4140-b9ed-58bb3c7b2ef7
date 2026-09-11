@@ -62,14 +62,17 @@ def init_db():
 
 # ---------- projects ----------
 
-def create_project(name, image_path, w, h, base_exposure=10.0):
+def create_project(name, image_path, w, h, base_exposure=10.0,
+                   magnification=1.0, aperture="f/8", paper_grade=2):
     conn = get_db()
     try:
         cur = conn.execute(
             """INSERT INTO projects (name, image_path, image_w, image_h,
-                                     base_exposure, plan, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, '{}', ?, ?)""",
-            (name, str(image_path), w, h, base_exposure, now(), now()),
+                                     base_exposure, magnification, aperture,
+                                     paper_grade, plan, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)""",
+            (name, str(image_path), w, h, base_exposure,
+             magnification, aperture, paper_grade, now(), now()),
         )
         conn.commit()
         return cur.lastrowid
