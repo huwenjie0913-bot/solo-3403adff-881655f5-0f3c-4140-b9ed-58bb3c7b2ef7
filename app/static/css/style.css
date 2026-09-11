@@ -137,3 +137,16 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
   .no-print { display: none !important; }
   body { background: #fff; color: #000; }
 }
+
+/* 实体遮挡板模块 */
+.mb-work { grid-template-columns: 300px minmax(0,1fr) 300px;
+  grid-template-rows: 46px minmax(0,1fr); }
+#mb-canvas { position: absolute; inset: 0; touch-action: none; cursor: default; }
+.mb-work .stage { background: #0c0d10; }
+.mb-work .seg button { font-size: 11px; padding: 3px 7px; }
+#cal-table input { width: 100%; }
+#cal-list .item { font-size: 11px; }
+#cal-list .item .grow { flex: 1; }
+#mb-stage .row button { font-size: 11px; padding: 3px 8px; }
+#mb-stage .row button.on { background: #8a5e1f; border-color: var(--accent); color: #fff; }
+#tool-params .kv { grid-template-columns: 92px 1fr; }

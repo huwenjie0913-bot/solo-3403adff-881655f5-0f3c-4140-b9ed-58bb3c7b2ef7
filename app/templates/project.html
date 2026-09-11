@@ -13,6 +13,8 @@
     <button id="btn-versions">版本列表</button>
     <a href="{{ url_for('print_sheet', pid=project.id) }}" target="_blank">
       <button class="primary">打印操作单</button></a>
+    <a href="{{ url_for('maskboard_page', pid=project.id) }}">
+      <button>实体遮挡板</button></a>
     <a href="{{ url_for('export_json', pid=project.id) }}"><button>导出 JSON</button></a>
   </div>
 

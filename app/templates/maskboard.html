@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}实体遮挡板 · {{ project.name }}{% endblock %}
+{% block body %}
+<div class="work mb-work" id="mb-app" data-pid="{{ project.id }}">
+  <!-- 顶栏 -->
+  <div class="topbar no-print">
+    <a href="{{ url_for('project_page', pid=project.id) }}">← 返回编排台</a>
+    <input id="proj-name" value="{{ project.name }}" style="width:180px" disabled>
+    <span class="tag" id="mb-version">工具版本 {{ tool_version }}</span>
+    <div class="grow"></div>
+    <button id="mb-save">保存</button>
+    <a id="mb-export" href="{{ url_for('maskboard_svg', pid=project.id) }}" target="_blank">
+      <button class="primary">导出拼版 SVG（1:1）</button></a>
+  </div>
+
+  <!-- 左栏 -->
+  <div class="sidebar no-print">
+    <h2 style="margin-top:2">相纸 / 板材</h2>
+    <div class="muted" id="paper-info" style="font-size:11px"></div>
+    <div class="kv">板材宽(mm)<input type="number" id="sh-w" min="10" step="1" value="{{ settings.paper_w }}"></div>
+    <div class="kv">板材高(mm)<input type="number" id="sh-h" min="10" step="1" value="{{ settings.paper_h }}"></div>
+
+    <h2>投影校准（圆片法）</h2>
+    <p class="muted" style="margin:4px 0;font-size:11px">
+      把已知直径的圆片放在距相纸<strong>至少两个高度</strong>，记录投影直径与照度过渡带宽，
+      拟合 s(h)=1+βh 与 band=w₀+γh。</p>
+    <div class="kv">选用校准
+      <select id="cal-select"><option value="">—</option></select></div>
+    <div class="kv">圆片直径(mm)<input type="number" id="cal-disc" min="1" step="0.1" value="20"></div>
+    <table class="cal-table" id="cal-table">
+      <thead><tr><th>高度h</th><th>投影⌀</th><th>过渡带</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="row">
+      <button id="cal-add">+ 高度</button>
+      <button id="cal-fit" class="primary">拟合</button>
+      <button id="cal-save">存为校准</button>
+    </div>
+    <div id="cal-info" class="muted" style="font-size:11px;margin-top:4px"></div>
+    <div id="cal-list"></div>
+
+    <h2>遮挡板</h2>
+    <div class="kv">关联区域<select id="region-select"></select></div>
+    <div class="row"><button id="tool-create" class="primary">从区域反算遮挡板</button></div>
+    <div id="tool-list"></div>
+  </div>
+
+  <!-- 舞台 -->
+  <div class="stage no-print" id="mb-stage" tabindex="0">
+    <canvas id="mb-canvas"></canvas>
+    <div style="position:absolute;left:10px;top:8px;z-index:20" class="row">
+      <div class="seg" id="mb-layers">
+        <button data-layer="target" class="on">目标</button>
+        <button data-layer="project" class="on">投影+误差带</button>
+        <button data-layer="board" class="on">切割线</button>
+        <button data-layer="handle" class="on">手柄</button>
+      </div>
+    </div>
+    <div style="position:absolute;left:10px;bottom:8px;z-index:20" class="row">
+      <button id="mode-hole">＋ 加孔洞模式</button>
+      <button id="del-vertex">删除选中点</button>
+      <button id="del-hole">删除选中孔洞</button>
+      <button id="recalc-btn">按参数重新反算</button>
+    </div>
+    <div style="position:absolute;right:10px;bottom:8px;z-index:20" class="muted" id="mb-cursor"></div>
+  </div>
+
+  <!-- 右栏 -->
+  <div class="rightbar no-print">
+    <h2 style="margin-top:2">板参数</h2>
+    <div id="tool-params" class="muted">先在左栏选择区域并创建遮挡板。</div>
+
+    <h2>问题检测 <span class="muted" id="issue-summary"></span></h2>
+    <div id="issue-list" class="muted">—</div>
+
+    <h2>版本与偏差比较</h2>
+    <div class="row">
+      <input id="tv-label" placeholder="版本标签" style="flex:1;min-width:0">
+      <button id="tv-save">存版本</button>
+    </div>
+    <div id="tv-list" class="muted">—</div>
+    <div class="row">
+      <button id="tv-compare">比较勾选的两版</button>
+    </div>
+    <div id="tv-diff" class="muted" style="font-size:11px"></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script id="mb-init" type="application/json">{"calibrations": {{ calibrations|tojson }}, "tool_version": "{{ tool_version }}"}</script>
+
+<script type="module">
+import { MaskBoardApp } from '{{ url_for("static", filename="js/maskboard_editor.js") }}?v=1';
+new MaskBoardApp({{ project.id }});
+</script>
+{% endblock %}
