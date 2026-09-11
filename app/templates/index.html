@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="home">
+  <h1>暗房局部遮挡 / 加光编排</h1>
+  <p class="muted">本机离线运行 · 导入底片扫描 → 校准相纸响应 → 圈定遮挡/加光 → 时间轴编排 → 导出打印操作单</p>
+
+  <div class="card">
+    <h2 style="margin-top:0">新建方案</h2>
+    <form id="new-form" class="form-grid">
+      <label class="full">方案名称
+        <input name="name" required placeholder="例如：4×5 老巷 01"></label>
+      <label class="full">底片扫描图（PNG/JPG/TIF，仅保存在本机）
+        <input name="image" type="file" accept="image/*" required></label>
+      <label>基础曝光（秒）
+        <input name="base_exposure" type="number" step="0.1" min="0.1" value="10"></label>
+      <label>放大倍率
+        <input name="magnification" type="number" step="0.1" min="0.1" value="2"></label>
+      <label>光圈
+        <input name="aperture" placeholder="f/8" value="f/8"></label>
+      <label>相纸反差号
+        <select name="paper_grade">
+          <option value="0">0 号（最软）</option>
+          <option value="1">1 号</option>
+          <option value="2" selected>2 号</option>
+          <option value="3">3 号</option>
+          <option value="4">4 号</option>
+          <option value="5">5 号（最硬）</option>
+        </select></label>
+      <div class="full" style="margin-top:6px">
+        <button class="primary" type="submit">导入并开始编排</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">已有方案</h2>
+    {% if projects %}
+      {% for p in projects %}
+      <div class="proj-row">
+        <div class="grow">
+          <a href="{{ url_for('project_page', pid=p.id) }}"><strong>{{ p.name }}</strong></a>
+          <div class="muted">{{ p.image_w }}×{{ p.image_h }} · {{ p.magnification }}× · {{ p.aperture }} ·
+            基础 {{ p.base_exposure }}s · {{ p.paper_grade }} 号纸 · 更新于 {{ p.updated_at }}</div>
+        </div>
+        <button class="danger" data-del="{{ p.id }}" data-name="{{ p.name }}">删除</button>
+      </div>
+      {% endfor %}
+    {% else %}
+      <p class="muted">还没有方案。</p>
+    {% endif %}
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+document.getElementById('new-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const r = await fetch('/api/projects', { method: 'POST', body: fd });
+  if (!r.ok) { alert('导入失败：' + (await r.json()).error); return; }
+  const d = await r.json();
+  location.href = d.redirect;
+});
+document.querySelectorAll('[data-del]').forEach(btn => btn.addEventListener('click', async () => {
+  if (!confirm(`删除方案「${btn.dataset.name}」及其所有版本？`)) return;
+  await fetch('/api/projects/' + btn.dataset.del, { method: 'DELETE' });
+  location.reload();
+}));
+</script>
+{% endblock %}

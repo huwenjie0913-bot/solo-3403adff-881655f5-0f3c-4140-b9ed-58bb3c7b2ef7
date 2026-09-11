@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }} · 暗房编排{% endblock %}
+{% block body %}
+<div class="work" id="app" data-pid="{{ project.id }}">
+  <!-- 顶栏 -->
+  <div class="topbar no-print">
+    <a href="{{ url_for('index') }}">← 方案列表</a>
+    <input id="proj-name" value="{{ project.name }}" style="width:200px">
+    <span class="tag" id="cal-status">未校准</span>
+    <div class="grow"></div>
+    <button id="btn-save">保存</button>
+    <button id="btn-version">存为版本</button>
+    <button id="btn-versions">版本列表</button>
+    <a href="{{ url_for('print_sheet', pid=project.id) }}" target="_blank">
+      <button class="primary">打印操作单</button></a>
+    <a href="{{ url_for('export_json', pid=project.id) }}"><button>导出 JSON</button></a>
+  </div>
+
+  <!-- 左栏 -->
+  <div class="sidebar no-print">
+    <h2 style="margin-top:2">放大参数</h2>
+    <div class="kv">放大倍率<input type="number" id="f-mag" step="0.1" min="0.5" value="{{ project.magnification }}"></div>
+    <div class="kv">光圈<input id="f-apt" value="{{ project.aperture }}"></div>
+    <div class="kv">基础曝光(s)<input type="number" id="f-base" step="0.1" min="0.1" value="{{ project.base_exposure }}"></div>
+    <div class="kv">反差号
+      <select id="f-grade">
+        {% for g in [0,1,2,3,4,5] %}
+        <option value="{{g}}" {% if g==project.paper_grade %}selected{% endif %}>{{g}} 号</option>
+        {% endfor %}
+      </select></div>
+    <div class="kv">底片极性
+      <select id="f-invert"><option value="0" {% if not project.negative_invert %}selected{% endif %}>底片扫描（默认）</option>
+      <option value="1" {% if project.negative_invert %}selected{% endif %}>正像/反相图</option></select></div>
+
+    <h2>相纸响应校准</h2>
+    <p class="muted" style="margin:4px 0">录入阶梯曝光条：每档秒数与在相纸上实测灰度（0=黑，255=白纸）。
+      也可在右侧扫描图上取点。</p>
+    <table class="cal-table" id="cal-table">
+      <thead><tr><th>秒</th><th>灰度</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="row">
+      <button id="cal-add">+ 一档</button>
+      <button id="cal-fit" class="primary">拟合曲线</button>
+      <button id="cal-clear">清空</button>
+    </div>
+    <canvas id="curve-canvas" width="520" height="260"></canvas>
+    <div id="cal-info" class="muted" style="margin-top:4px"></div>
+    <div class="row muted" style="font-size:11px">
+      <label class="row" style="margin:0"><input type="checkbox" id="eyedrop"> 扫描图取灰度</label>
+    </div>
+
+    <h2>区域 / 工具</h2>
+    <div class="seg">
+      <button id="tool-brush" class="on">画笔</button>
+      <button id="tool-poly">多边形</button>
+    </div>
+    <div class="kv">工具直径(px)<input type="number" id="tool-size" value="90" min="2" step="1"></div>
+    <div class="kv">羽化(px)<input type="number" id="tool-feather" value="12" min="0" step="1"></div>
+    <div id="region-list"></div>
+  </div>
+
+  <!-- 舞台 -->
+  <div class="stage no-print" id="stage">
+    <canvas id="cv-image"></canvas>
+    <canvas id="cv-mask"></canvas>
+    <canvas id="cv-contour"></canvas>
+    <canvas id="cv-draw"></canvas>
+    <canvas id="crosshair"></canvas>
+    <div id="flash"></div>
+    <div style="position:absolute;left:10px;top:8px;z-index:20" class="row">
+      <div class="seg" id="view-mode">
+        <button data-mode="final" class="on">最终灰度</button>
+        <button data-mode="delta">增减效果</button>
+        <button data-mode="base">基础</button>
+        <button data-mode="mask">遮罩</button>
+      </div>
+      <label class="row" style="margin:0;color:#cfd2da"><input type="checkbox" id="show-contour" checked>等密度线</label>
+      <label class="row" style="margin:0;color:#cfd2da"><input type="checkbox" id="show-mask" checked>覆盖</label>
+    </div>
+    <div id="cursor-t" style="position:absolute;right:10px;bottom:6px;z-index:20;color:#9aa"></div>
+  </div>
+
+  <!-- 右栏 -->
+  <div class="rightbar no-print">
+    <h2 style="margin-top:2">本步参数</h2>
+    <div id="step-editor" class="muted">在时间轴上点选一个遮挡/加光步骤进行编辑；
+      或先在图上画好区域，再点下方按钮生成步骤。</div>
+    <div class="row" id="step-create" style="display:none">
+      <button id="create-dodge">→ 加入遮挡步骤</button>
+      <button id="create-burn">→ 加入加光步骤</button>
+    </div>
+
+    <h2>问题检测</h2>
+    <div id="warn-list" class="muted">尚未计算。</div>
+
+    <h2>版本</h2>
+    <div id="version-list" class="muted">—</div>
+  </div>
+
+  <!-- 时间轴 -->
+  <div class="timeline-wrap no-print">
+    <div class="row" style="margin:0 0 2px">
+      <strong>时间轴</strong>
+      <span class="muted" id="tl-summary"></span>
+      <div class="grow"></div>
+      <span class="muted">拖动色块移动步骤；拖右边缘改时长（遮挡比例/加光档数）。基础曝光结束于
+        <strong id="base-end-label"></strong>s</span>
+    </div>
+    <div class="timeline" id="timeline">
+      <div class="tl-lane tl-base" id="lane-base" style="top:4px"></div>
+      <div class="tl-lane" id="lane-dodge" style="top:42px"></div>
+      <div class="tl-lane" id="lane-burn" style="top:80px"></div>
+      <div class="tl-cursor" id="tl-cursor" style="display:none"></div>
+      <div class="tl-ticks" id="tl-ticks"></div>
+      <div class="tl-label" style="top:4px">基础</div>
+      <div class="tl-label" style="top:42px">遮挡（基础段内）</div>
+      <div class="tl-label" style="top:80px">加光（基础后/分段）</div>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script type="module">
+import { App } from '{{ url_for("static", filename="js/app.js") }}?v=1';
+new App({{ project.id }});
+</script>
+{% endblock %}

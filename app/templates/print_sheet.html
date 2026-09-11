@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>打印操作单 · {{ p.name }}</title>
+<style>
+  @page { size: A4; margin: 14mm; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+         color: #111; font-size: 12px; margin: 0; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 14px; border-bottom: 2px solid #333; padding-bottom: 2px;
+       margin: 16px 0 6px; }
+  .meta { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px 12px;
+          background: #eee; padding: 8px; border-radius: 4px; }
+  .meta b { display: block; color: #555; font-weight: normal; font-size: 10px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+  th, td { border: 1px solid #999; padding: 3px 6px; text-align: left; }
+  th { background: #eee; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  img.shot { width: 100%; border: 1px solid #999; image-rendering: auto; }
+  .thumb { width: 150px; border: 1px solid #888; }
+  .thumbs { display: flex; flex-wrap: wrap; gap: 8px; }
+  .thumb-box { font-size: 10px; width: 152px; }
+  .warn { border-left: 4px solid #c0392b; background: #fdecea; padding: 4px 8px;
+          margin: 3px 0; }
+  .warn.warnm { border-left-color: #d68910; background: #fef5e7; }
+  .nodes li { margin: 2px 0; }
+  .swatch { display:inline-block; width:10px;height:10px;border:1px solid #333;
+            vertical-align: middle; margin-right:4px; }
+  .foot { color:#666; font-size:10px; margin-top:10px; }
+  .big { font-size: 15px; font-weight: bold; }
+  @media screen { body { max-width: 800px; margin: 20px auto; padding: 0 12px; } }
+</style>
+</head>
+<body>
+  <div style="display:flex;justify-content:space-between;align-items:baseline">
+    <h1>放大打印操作单</h1>
+    <button onclick="window.print()" class="no-print"
+      style="font-size:14px;padding:6px 16px">🖨 打印</button>
+  </div>
+  <div><b>{{ p.name }}</b> · 生成于 {{ now_ts }}</div>
+
+  <h2>一、放大条件</h2>
+  <div class="meta">
+    <div><b>放大倍率</b><span class="big">{{ p.magnification }}×</span></div>
+    <div><b>光圈</b><span class="big">{{ p.aperture }}</span></div>
+    <div><b>基础曝光</b><span class="big">{{ p.base_exposure }} s</span></div>
+    <div><b>相纸反差号</b><span class="big">{{ p.paper_grade }} 号</span></div>
+    <div><b>底片尺寸</b>{{ p.image_w }}×{{ p.image_h }} px 扫描</div>
+    <div><b>极性</b>{{ '正像/反相' if p.negative_invert else '底片扫描' }}</div>
+    <div><b>曲线校准</b>{{ '已校准（RMS %.2f）'|format(cal.rms) if cal.calibrated else '未校准（默认曲线）' }}</div>
+    <div><b>总耗时</b><span class="big">{{ '%.1f'|format(total) }} s</span></div>
+  </div>
+  {% if cal.calibrated and cal.range %}
+  <p style="margin:6px 0">实测响应区间：<b>{{ '%.1f'|format(p.base_exposure * 10**cal.range[0]) }}s
+    – {{ '%.1f'|format(p.base_exposure * 10**cal.range[1]) }}s</b>
+    （相对基础曝光）；曲线参数 Dmin={{ '%.2f'|format(cal.params.Dmin) }}
+    Dmax={{ '%.2f'|format(cal.params.Dmax) }} x0={{ '%.2f'|format(cal.params.x0) }}
+    k={{ '%.2f'|format(cal.params.k) }}</p>
+  {% endif %}
+
+  <h2>二、动作顺序与秒表节点</h2>
+  <p class="foot" style="margin-top:0">从 0s 起全程跟随秒表；遮挡工具保持持续小幅移动以避免硬边。</p>
+  <ol class="nodes">
+    {% for t, action in nodes %}
+    <li><b>{{ '%6.1f'|format(t) }}s</b> — {{ action }}</li>
+    {% endfor %}
+  </ol>
+
+  <h2>三、分段步骤</h2>
+  <table>
+    <thead><tr><th>#</th><th>类型</th><th>区域</th><th>开始(s)</th><th>持续(s)</th><th>结束(s)</th>
+      <th>参数</th><th>工具直径/羽化</th></tr></thead>
+    <tbody>
+    {% for r in rows %}
+      <tr>
+        <td>{{ r.n }}</td>
+        <td><span class="swatch" style="background:{{ '#ff8c1a' if r.type=='加光' else '#50aaff' }}"></span>{{ r.type }}</td>
+        <td>{{ r.region }}</td>
+        <td>{{ '%.1f'|format(r.start) }}</td>
+        <td><b>{{ '%.1f'|format(r.dur) }}</b></td>
+        <td>{{ '%.1f'|format(r.end) }}</td>
+        <td>{{ r.param }}</td>
+        <td>{% if r.kind == 'brush' %}{{ '%.0f'|format(r.size or 0) }}px / {{ '%.0f'|format(r.feather or 0) }}px
+            {% else %}多边形 / {{ '%.0f'|format(r.feather or 0) }}px 羽化{% endif %}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="8">无局部步骤（纯基础曝光）。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>四、预览与遮罩缩略图</h2>
+  <div class="cols">
+    <div>
+      <b>最终灰度预览（含工具覆盖）</b>
+      <img class="shot" src="{{ result_img }}" alt="final">
+    </div>
+    <div>
+      <b>基础曝光（无干预）</b>
+      <img class="shot" src="{{ base_img }}" alt="base">
+      <h2 style="margin-top:10px">遮罩缩略图</h2>
+      <div class="thumbs">
+        {% for t in thumbs %}
+        <div class="thumb-box">
+          <img class="thumb" src="{{ t.img }}" alt=""><br>
+          {{ t.label }}（羽化 {{ '%.0f'|format(t.feather) }}px）
+        </div>
+        {% else %}<span class="foot">无</span>{% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <h2>五、问题与注意</h2>
+  {% for w in warnings %}
+  <div class="warn {{ '' if w.severity == 'error' else 'warnm' }}">
+    【{{ '必须处理' if w.severity == 'error' else '建议检查' }}】{{ w.message }}
+    {% if w.time %}（时段 {{ '%.1f–%.1fs'|format(w.time[0], w.time[1]) }}）{% endif %}
+  </div>
+  {% else %}<p>未检测到超范围、边缘跳变、抵消或双工具冲突。</p>{% endfor %}
+
+  <p class="foot">本操作单由本机暗房编排应用生成，图像与数据未离开本机。
+    建议正式放大前先做试条确认曲线；操作时遮挡工具距放大机镜头保持适当高度并持续移动。</p>
+</body>
+</html>
