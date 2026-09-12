@@ -386,9 +386,11 @@ def api_mask_regions(pid):
     if not p:
         abort(404)
     plan = load_plan(p)
+    settings = db.get_mask_settings(pid)
+    pw, ph, pxmm_x, pxmm_y, source = maskboard.print_size_mm(p, settings)
     out = []
     for r in plan.get("regions", []):
-        target = maskboard.extract_target_loops(r, p)
+        target = maskboard.extract_target_loops(r, p, settings)
         out.append({
             "id": r["id"], "name": r.get("name", "区域"),
             "kind": r.get("kind", "brush"),
@@ -398,7 +400,14 @@ def api_mask_regions(pid):
             "n_points": len(r.get("points", [])),
             "n_strokes": len(r.get("strokes", [])),
         })
-    return jsonify({"paper_mm": maskboard.paper_size_mm(p), "regions": out})
+    return jsonify({
+        "paper_mm": [pw, ph],
+        "scale_source": source,
+        "px_per_mm": [pxmm_x, pxmm_y],
+        "print_size": [settings.get("print_w") or 0,
+                       settings.get("print_h") or 0],
+        "sheet_mm": [settings["paper_w"], settings["paper_h"]],
+        "regions": out})
 
 
 @app.route("/api/mask-calibrations")
@@ -479,7 +488,7 @@ def _recompute_tool(spec, project, region, settings, fit=None,
                     force_backcalc=False):
     """按 spec 重算投影/问题。spec.outer 存在（已反算或已手改）时直接投影，
     否则先按高度/羽化从目标反算；force_backcalc=True 强制重新反算。"""
-    target = maskboard.extract_target_loops(region, project)
+    target = maskboard.extract_target_loops(region, project, settings)
     pred = maskboard.predict(fit, spec["height"])
     if pred is None:
         pred = {"scale": 1.0, "band": 0.0, "scale_err": 0.0,
@@ -491,7 +500,7 @@ def _recompute_tool(spec, project, region, settings, fit=None,
         calc = _calc_from_spec(spec, pred)
     issues = maskboard.validate(
         spec, calc, target, project,
-        settings["paper_w"], settings["paper_h"], fit)
+        settings["paper_w"], settings["paper_h"], fit, settings)
     return target, pred, calc, issues
 
 
@@ -656,9 +665,18 @@ def api_mask_settings(pid):
     if not db.get_project(pid):
         abort(404)
     data = request.get_json(force=True)
-    db.update_mask_settings(pid, float(data["paper_w"]),
-                            float(data["paper_h"]))
-    return jsonify({"ok": True})
+    cur = db.get_mask_settings(pid)
+    paper_w = float(data.get("paper_w", cur["paper_w"]))
+    paper_h = float(data.get("paper_h", cur["paper_h"]))
+    print_w = float(data.get("print_w", cur.get("print_w") or 0) or 0)
+    print_h = float(data.get("print_h", cur.get("print_h") or 0) or 0)
+    db.update_mask_settings(pid, paper_w, paper_h, print_w, print_h)
+    p = db.get_project(pid)
+    new_settings = db.get_mask_settings(pid)
+    pw, ph, pxmm_x, pxmm_y, source = maskboard.print_size_mm(p, new_settings)
+    return jsonify({"ok": True,
+                    "paper_mm": [pw, ph], "scale_source": source,
+                    "px_per_mm": [pxmm_x, pxmm_y]})
 
 
 @app.route("/api/mask-tools/<int:tid>/versions")
@@ -754,8 +772,12 @@ def maskboard_svg(pid):
     if not docs:
         abort(404)
     nest = maskboard.nest_tools(nest_items, sheet_w, sheet_h)
-    svg = maskboard.export_svg(docs, nest, sheet_w, sheet_h,
-                               project_name=p["name"])
+    pw_mm, ph_mm, _, _, source = maskboard.print_size_mm(p, settings)
+    svg = maskboard.export_svg(
+        docs, nest, sheet_w, sheet_h, project_name=p["name"],
+        baseline={"print_w_mm": pw_mm, "print_h_mm": ph_mm,
+                  "image_w_px": p["image_w"], "image_h_px": p["image_h"],
+                  "magnification": p["magnification"], "source": source})
     resp = Response(svg, mimetype="image/svg+xml")
     resp.headers["Content-Disposition"] = (
         f'attachment; filename="maskboard-{pid}.svg"')

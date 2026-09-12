@@ -26,6 +26,8 @@ export class MaskBoardApp {
     this.toolVersion = init.tool_version || TOOL_VERSION;
     this.regions = [];
     this.paperMm = {w: 200, h: 250};
+    this.scaleSource = 'magnification';
+    this.pxPerMm = {x: 1, y: 1};
     this.tools = [];
     this.selTool = null;
     this.selLoop = null;        // 'outer' | 'hole:<i>' | 'handle'
@@ -49,15 +51,23 @@ export class MaskBoardApp {
       fetch(`/api/projects/${this.pid}/mask-tools`).then(r => r.json()),
     ]);
     this.paperMm = {w: rmeta.paper_mm[0], h: rmeta.paper_mm[1]};
+    this.scaleSource = rmeta.scale_source || 'magnification';
+    this.pxPerMm = {x: rmeta.px_per_mm?.[0] || 1, y: rmeta.px_per_mm?.[1] || 1};
+    if (Array.isArray(rmeta.print_size)) {
+      this.$('print-w').value = rmeta.print_size[0] || 0;
+      this.$('print-h').value = rmeta.print_size[1] || 0;
+    }
+    if (Array.isArray(rmeta.sheet_mm)) {
+      this.$('sh-w').value = rmeta.sheet_mm[0];
+      this.$('sh-h').value = rmeta.sheet_mm[1];
+    }
     this.regions = rmeta.regions;
     // 初始数据岛只带校准列表，补拉最新列表
     await this.loadCalibrations();
     this.tools = rtools.tools.map(t => ({...t,
       spec: typeof t.spec === 'string' ? JSON.parse(t.spec) : t.spec,
       result: typeof t.result === 'string' ? JSON.parse(t.result) : t.result}));
-    this.$('paper-info').textContent =
-      `扫描 ${this.paperMm.w.toFixed(0)}×${this.paperMm.h.toFixed(0)}mm（放大后相纸）。` +
-      '板材可大于相纸；坐标原点在板材左下角。';
+    this.updatePaperInfo();
     this.renderRegionSelect();
     this.renderCalSelect();
     this.renderCalList();
@@ -65,7 +75,6 @@ export class MaskBoardApp {
     this.layoutCanvas();
     new ResizeObserver(() => this.layoutCanvas()).observe(this.$('mb-stage'));
     this.draw();
-    this.loadVersionsThrottled();
     setInterval(() => this.autosave(), 4000);
   }
 
@@ -73,6 +82,8 @@ export class MaskBoardApp {
   bind() {
     this.$('sh-w').onchange = () => this.sheetChange();
     this.$('sh-h').onchange = () => this.sheetChange();
+    this.$('print-w').onchange = () => this.printSizeChange();
+    this.$('print-h').onchange = () => this.printSizeChange();
 
     this.$('cal-disc').oninput = e => { this.disc = +e.target.value || 0; this.runFit(); };
     this.$('cal-add').onclick = () => {
@@ -124,10 +135,60 @@ export class MaskBoardApp {
     this._tt = setTimeout(() => t.classList.remove('show'), 2000);
   }
 
-  loadCalibrations() {
-    this.calibrations = this.calibrations || [];
-    return fetch('/api/mask-calibrations').then(r => r.json())
-      .then(j => { this.calibrations = j.calibrations; this.renderCalSelect(); });
+  async loadCalibrations(selectId) {
+    const j = await fetch('/api/mask-calibrations').then(r => r.json());
+    this.calibrations = j.calibrations;
+    this.renderCalSelect();
+    this.renderCalList();
+    if (selectId != null) {
+      this.$('cal-select').value = selectId;
+      const full = await fetch(`/api/mask-calibrations/${selectId}`).then(r => r.json());
+      this.disc = full.disc_diameter;
+      this.$('cal-disc').value = this.disc;
+      this.points = full.points || [];
+      this.fit = full.fit;
+      this.renderCalTable();
+      this.updateCalInfo();
+    }
+  }
+
+  renderCalList() {
+    const box = this.$('cal-list');
+    if (!box) return;
+    if (!this.calibrations.length) {
+      box.innerHTML = '<p class="muted" style="font-size:11px;margin:4px 0">尚无已保存校准。</p>';
+      return;
+    }
+    box.innerHTML = '';
+    for (const c of this.calibrations) {
+      const f = c.fit || {};
+      const div = document.createElement('div');
+      div.className = 'item' + (c.id === this.activeCalId ? ' sel' : '');
+      div.innerHTML =
+        `<div class="row" style="margin:0"><span class="name" style="font-size:12px">${esc(c.name)}</span></div>
+         <div class="muted" style="font-size:11px">⌀${c.disc_diameter}mm ·
+           ${f.calibrated ? 'β=' + (+f.beta).toFixed(5) +
+             `，RMS ${(+f.proj_rms).toFixed(2)}mm，${f.h_min}–${f.h_max}mm`
+             : '未拟合'}</div>
+         <div class="tools">
+           <button class="c-use">选用</button>
+           <button class="c-del danger">删除</button></div>`;
+      div.querySelector('.c-use').onclick = () => {
+        this.$('cal-select').value = c.id;
+        this.loadCalibration(c.id);
+        this.renderCalList();
+      };
+      div.querySelector('.c-del').onclick = async () => {
+        if (!confirm(`删除校准「${c.name}」？引用它的遮挡板将转为未绑定。`)) return;
+        await fetch(`/api/mask-calibrations/${c.id}`, {method: 'DELETE'});
+        if (this.activeCalId === c.id) {
+          this.activeCalId = null;
+          this.$('cal-select').value = '';
+        }
+        await this.loadCalibrations(this.activeCalId);
+      };
+      box.appendChild(div);
+    }
   }
 
   renderRegionSelect() {
@@ -179,20 +240,22 @@ export class MaskBoardApp {
     });
   }
 
-  loadCalibration(cid) {
+  async loadCalibration(cid) {
     this.activeCalId = cid || null;
-    const c = this.calibrations.find(x => x.id === cid);
-    if (!c) { this.points = []; this.fit = null; this.disc = +this.$('cal-disc').value || 20; }
-    else {
-      // points 存于校准记录；列表接口未带，创建工具时由服务端拟合，这里回读详情
-      this.$('cal-disc').value = c.disc_diameter;
-      this.disc = c.disc_diameter;
-      this.points = (c.fit.residuals || []).map(r =>
-        ({h: r.h, pd: r.pd, band: r.band}));
-      this.fit = c.fit;
+    if (!cid) {
+      this.points = []; this.fit = null;
+      this.disc = +this.$('cal-disc').value || 20;
+    } else {
+      // 列表接口不带原始测点，回读详情
+      const full = await fetch(`/api/mask-calibrations/${cid}`).then(r => r.json());
+      this.disc = full.disc_diameter;
+      this.$('cal-disc').value = this.disc;
+      this.points = full.points || [];
+      this.fit = full.fit;
     }
     this.renderCalTable();
     this.updateCalInfo();
+    this.renderCalList();
     this.recomputeCurrent();
   }
 
@@ -238,32 +301,16 @@ export class MaskBoardApp {
       const r = await fetch(`/api/mask-calibrations/${this.activeCalId}`, {
         method: 'PUT', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({name, disc_diameter: this.disc, points: this.points})});
-      if (r.ok) { this.toast('校准已更新'); await this.reloadCalibrations(this.activeCalId); }
+      if (r.ok) { this.toast('校准已更新'); await this.loadCalibrations(this.activeCalId); }
     } else {
       const r = await fetch('/api/mask-calibrations', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({name, disc_diameter: this.disc, points: this.points})});
       const j = await r.json();
       if (j.id) { this.activeCalId = j.id; this.toast('校准已保存');
-        await this.reloadCalibrations(j.id); }
+        await this.loadCalibrations(j.id); }
     }
     this.refreshToolCalibration();
-  }
-
-  async reloadCalibrations(selectId) {
-    const j = await fetch('/api/mask-calibrations').then(r => r.json());
-    this.calibrations = j.calibrations;
-    this.renderCalSelect();
-    if (selectId) {
-      this.$('cal-select').value = selectId;
-      const full = await fetch(`/api/mask-calibrations/${selectId}`).then(r => r.json());
-      this.points = full.points || [];
-      this.fit = full.fit;
-      this.disc = full.disc_diameter;
-      this.$('cal-disc').value = this.disc;
-      this.renderCalTable();
-      this.updateCalInfo();
-    }
   }
 
   refreshToolCalibration() {
@@ -346,6 +393,60 @@ export class MaskBoardApp {
     this.loadVersions();
   }
 
+  updatePaperInfo() {
+    const src = this.scaleSource === 'print_size' ? '显式打印尺寸' : '扫描像素×放大倍率';
+    this.$('paper-info').textContent =
+      `打印影像 ${this.paperMm.w.toFixed(1)}×${this.paperMm.h.toFixed(1)}mm · ` +
+      `1px≈${(1 / this.pxPerMm.x).toFixed(3)}mm（${src}）。板材可大于影像；原点在板材左下角。`;
+  }
+
+  async printSizeChange() {
+    const printW = Math.max(0, +this.$('print-w').value || 0);
+    const printH = Math.max(0, +this.$('print-h').value || 0);
+    const r = await fetch(`/api/projects/${this.pid}/mask-settings`, {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        paper_w: +this.$('sh-w').value, paper_h: +this.$('sh-h').value,
+        print_w: printW, print_h: printH})});
+    const j = await r.json();
+    this.paperMm = {w: j.paper_mm[0], h: j.paper_mm[1]};
+    this.scaleSource = j.scale_source;
+    this.pxPerMm = {x: j.px_per_mm[0], y: j.px_per_mm[1]};
+    this.updatePaperInfo();
+    // 基准变了：目标轮廓必须按新毫米基准重新拉取，再对所有板重算
+    await this.reloadRegionsAndTools();
+    this.toast('实体尺度基准已更新，轮廓已按新基准重算');
+  }
+
+  async reloadRegionsAndTools() {
+    const meta = await fetch(`/api/projects/${this.pid}/mask-regions`)
+      .then(r => r.json());
+    this.regions = meta.regions;
+    this.paperMm = {w: meta.paper_mm[0], h: meta.paper_mm[1]};
+    this.scaleSource = meta.scale_source;
+    this.pxPerMm = {x: meta.px_per_mm[0], y: meta.px_per_mm[1]};
+    this.renderRegionSelect();
+    // 基准变了：所有板按新基准重新反算
+    for (const tt of this.tools) {
+      await this.recalcServer(tt, {height: tt.spec.height});
+    }
+    this.draw();
+    this.renderToolList();
+    this.renderParams();
+  }
+
+  async recalcServer(t, body) {
+    const r = await fetch(`/api/mask-tools/${t.id}/recalc`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)});
+    if (!r.ok) return;
+    const j = await r.json();
+    t.spec = j.spec;
+    t.result = {...t.result, ...j.result, target: this.regions.find(
+      x => x.id === (t.spec.region_id || t.region_id))};
+    this.renderIssues();
+  }
+
   sheetChange() {
     const t = this.tool();
     if (t) {
@@ -356,7 +457,9 @@ export class MaskBoardApp {
     fetch(`/api/projects/${this.pid}/mask-settings`, {
       method: 'PUT', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({paper_w: +this.$('sh-w').value,
-                            paper_h: +this.$('sh-h').value})});
+                            paper_h: +this.$('sh-h').value,
+                            print_w: +this.$('print-w').value || 0,
+                            print_h: +this.$('print-h').value || 0})});
   }
 
   renderParams() {
@@ -854,7 +957,6 @@ export class MaskBoardApp {
   }
 
   // ------------------------------------------------------------ 持久化
-  dirty: false;
   mark() {
     this.dirty = true;
     this.updateExportLink();
@@ -903,8 +1005,6 @@ export class MaskBoardApp {
     if (r.ok) { this.toast('版本已保存'); this.$('tv-label').value = '';
       this.loadVersions(); }
   }
-
-  loadVersionsThrottled() {}
 
   async loadVersions() {
     const t = this.tool();

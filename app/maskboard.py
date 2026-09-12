@@ -123,17 +123,38 @@ def predict(fit, h):
 
 # ---------------------------------------------------------------- 区域 → 毫米轮廓
 
-def paper_size_mm(project):
-    """由扫描尺寸 * 放大倍率得到相纸尺寸（长边对齐，保持宽高比）。"""
-    mag = max(0.01, float(project.get("magnification", 1)))
-    w = float(project.get("image_w", 1)) * mag
-    h = float(project.get("image_h", 1)) * mag
-    return w, h
+def print_size_mm(project, settings=None):
+    """像素→毫米的实体换算基准。
+
+    优先使用项目遮挡板设置中显式录入的“打印影像尺寸”(mm)；
+    未录入时回退到 扫描像素 × 放大倍率（旧行为）。
+    返回 (print_w_mm, print_h_mm, px_per_mm_x, px_per_mm_y, source)。
+    """
+    img_w = max(1.0, float(project.get("image_w", 1)))
+    img_h = max(1.0, float(project.get("image_h", 1)))
+    pw = float((settings or {}).get("print_w") or 0)
+    ph = float((settings or {}).get("print_h") or 0)
+    source = "print_size"
+    if pw <= 0 and ph <= 0:
+        mag = max(0.01, float(project.get("magnification", 1)))
+        pw, ph = img_w * mag, img_h * mag
+        source = "magnification"
+    elif pw <= 0:          # 只给高：按扫描宽高比补宽
+        pw = ph * img_w / img_h
+    elif ph <= 0:          # 只给宽：按比补高
+        ph = pw * img_h / img_w
+    return pw, ph, img_w / pw, img_h / ph, source
 
 
-def region_to_mm(region, project):
+def paper_size_mm(project, settings=None):
+    """打印影像在相纸上的实体尺寸 (mm)。"""
+    pw, ph, _, _, _ = print_size_mm(project, settings)
+    return pw, ph
+
+
+def region_to_mm(region, project, settings=None):
     """归一化区域坐标 → 毫米坐标（板材坐标系，原点左下，y 向上）。"""
-    pw, ph = paper_size_mm(project)
+    pw, ph = paper_size_mm(project, settings)
     pts = []
     for p in region.get("points", []):
         pts.append({"x": float(p["x"]) * pw,
@@ -141,25 +162,26 @@ def region_to_mm(region, project):
     return pts
 
 
-def _raster_mm(region, project, mm_per_cell=1.5):
+def _raster_mm(region, project, settings=None, mm_per_cell=1.5):
     """把区域栅格化为相纸毫米网格上的覆盖率（复用 engine 的区域定义）。
     返回 (mask, (mm_x, mm_y))：每个栅格在 x/y 方向对应的毫米数。"""
     from . import engine
-    pw, ph = paper_size_mm(project)
+    pw, ph, pxmm_x, pxmm_y, _ = print_size_mm(project, settings)
     W = max(8, int(round(pw / mm_per_cell)))
     H = max(8, int(round(ph / mm_per_cell)))
     mm_x, mm_y = pw / W, ph / H
-    # region 的 feather/size 以扫描像素给出；扫描 px → 栅格 px 的
-    # 换算为（扫描宽 × 放大倍率 / mm每格）/ 扫描宽 = mag/mm_per_cell。
-    mag = max(0.01, float(project.get("magnification", 1)))
-    k = mag / mm_per_cell
+    # region 的 feather/size 以扫描像素给出；扫描 px → mm 用显式基准
+    # （1/px_per_mm），再 → 栅格 px（/mm每格）。
+    kx = 1.0 / pxmm_x / mm_per_cell
+    ky = 1.0 / pxmm_y / mm_per_cell
+    k = (kx + ky) / 2.0
     conv = region.copy()
     conv["feather"] = max(0.0, float(region.get("feather", 0))) * k
     if conv.get("kind") == "brush":
         conv["size"] = max(1.0, float(region.get("size", 80))) * k
         # engine.rasterize_region 的笔画点取 0..1 归一坐标（内部再乘 W/H）。
         # 其按段插值在长线段接缝附近可能留缝，这里按笔刷半径预密化
-        # （r_norm 为扫描像素半径，段长同样换算到扫描像素）。
+        # （段长与半径都换算到扫描像素）。
         img_diag = math.hypot(float(project.get("image_w", 1)),
                               float(project.get("image_h", 1)))
         r_px = max(1.0, float(region.get("size", 80))) * 0.5
@@ -185,25 +207,28 @@ def _raster_mm(region, project, mm_per_cell=1.5):
     return m, (mm_x, mm_y)
 
 
-def extract_target_loops(region, project, simplify_tol=1.2):
+def extract_target_loops(region, project, settings=None, simplify_tol=1.2):
     """从区域定义提取相纸上的目标覆盖轮廓，返回
-    {outer:[[x,y]...mm], holes:[[...]], area_mm2, multiple:bool}。
-    多边形直接取顶点；画笔先栅格化再 marching-squares 成环并化简。
+    {outer:[[x,y]...mm], holes:[[...]], area_mm2, multiple:bool,
+     print_w_mm, print_h_mm, scale_source}。
+    多边形直接取顶点；画笔先栅格化再边界跟踪成环并化简。
     """
+    pw, ph, _, _, scale_source = print_size_mm(project, settings)
+    base = {"print_w_mm": pw, "print_h_mm": ph, "scale_source": scale_source}
     if region.get("kind") != "brush":
-        poly = region_to_mm(region, project)
+        poly = region_to_mm(region, project, settings)
         if len(poly) < 3:
-            return {"outer": [], "holes": [], "area": 0.0, "multiple": False}
+            return {"outer": [], "holes": [], "area": 0.0,
+                    "multiple": False, **base}
         poly = _simplify([(p["x"], p["y"]) for p in poly], simplify_tol)
         return {"outer": _as_list(poly), "holes": [],
-                "area": abs(_signed_area(poly)), "multiple": False}
+                "area": abs(_signed_area(poly)), "multiple": False, **base}
 
-    m, (mm_x, mm_y) = _raster_mm(region, project)
-    pw, ph = paper_size_mm(project)
-    Hpx, Wpx = m.shape
+    m, (mm_x, mm_y) = _raster_mm(region, project, settings)
     bit = (m > 0.5)
     if not bit.any():
-        return {"outer": [], "holes": [], "area": 0.0, "multiple": False}
+        return {"outer": [], "holes": [], "area": 0.0,
+                "multiple": False, **base}
     loops_px = _trace_boundaries(bit)
     rings = []
     for loop in loops_px:
@@ -215,7 +240,8 @@ def extract_target_loops(region, project, simplify_tol=1.2):
     # 面积最大的环为外环；其余被外环包含的为孔洞
     rings.sort(key=lambda r: abs(_signed_area(r)), reverse=True)
     if not rings:
-        return {"outer": [], "holes": [], "area": 0.0, "multiple": False}
+        return {"outer": [], "holes": [], "area": 0.0,
+                "multiple": False, **base}
     outer = rings[0]
     holes, extra = [], []
     for r in rings[1:]:
@@ -226,7 +252,7 @@ def extract_target_loops(region, project, simplify_tol=1.2):
     return {"outer": _as_list(outer), "holes": [_as_list(h) for h in holes],
             "area": abs(_signed_area(outer)),
             "multiple": bool(extra),
-            "extra_outers": [_as_list(e) for e in extra]}
+            "extra_outers": [_as_list(e) for e in extra], **base}
 
 
 def _trace_boundaries(bit):
@@ -593,7 +619,8 @@ def handle_anchor_suggest(outer, direction):
 
 # ---------------------------------------------------------------- 问题检测
 
-def validate(spec, calc_result, target, project, paper_w, paper_h, fit=None):
+def validate(spec, calc_result, target, project, paper_w, paper_h,
+             fit=None, settings=None):
     """汇总遮挡板的全部问题，返回 issue 列表。
     issue: {kind, severity:'error'|'warn', message, where?}
     """
@@ -685,7 +712,7 @@ def validate(spec, calc_result, target, project, paper_w, paper_h, fit=None):
             "bbox": bb})
 
     # 6) 目标落在相纸外（关联区域本身异常）
-    pw, ph = paper_size_mm(project)
+    pw, ph = paper_size_mm(project, settings)
     tb = bbox_of([target["outer"]])
     if tb and (tb["x"] < 0 or tb["y"] < 0 or
                tb["x"] + tb["w"] > pw + 1e-6 or tb["y"] + tb["h"] > ph + 1e-6):
@@ -801,7 +828,7 @@ def svg_path(loop, ox=0.0, oy=0.0):
 
 
 def export_svg(tool_docs, nest, sheet_w, sheet_h, project_name="",
-               tool_version=TOOL_VERSION):
+               tool_version=TOOL_VERSION, baseline=None):
     """生成按实际尺寸（1 单位 = 1mm）的切割 SVG。"""
     pl = nest["placements"]
     out = [SVG_HEADER.format(w=round(sheet_w, 2), h=round(sheet_h, 2))]
@@ -885,16 +912,26 @@ def export_svg(tool_docs, nest, sheet_w, sheet_h, project_name="",
             out.append(f'<text class="sub" x="{lx:.2f}" y="{ly + 5.2:.2f}" '
                        f'fill="#c00">含错误：导出仅供排查，勿直接切割</text>')
 
-    # 比例校验框（50mm 标准方框 + 标注）
-    bx, by, bl = 8.0, sheet_h - 14.0, ERROR_TOL_MM * 20 / 1.2  # 50mm
-    bl = 50.0
-    out.append(f'<rect class="frame" x="{bx}" y="{by}" width="{bl}" height="{bl}"/>')
+    # 比例校验框（50mm 标准方框 + 标注），置于板材左下角内
+    bx, bl = 8.0, 50.0
+    by = sheet_h - bx - bl     # 方框底沿距板材下边 8mm
+    out.append(f'<rect class="frame" x="{bx}" y="{by:.2f}" width="{bl:.2f}" height="{bl:.2f}"/>')
     for k in range(1, 10):
         x = bx + bl * k / 10
         out.append(f'<line class="mark" x1="{x:.2f}" y1="{by + bl:.2f}" '
                    f'x2="{x:.2f}" y2="{by + bl - (2 if k % 5 else 4):.2f}"/>')
-    out.append(f'<text class="sub" x="{bx}" y="{by + bl + 3.2:.2f}">'
+    out.append(f'<text class="sub" x="{bx}" y="{by - 3:.2f}">'
                f'比例校验框：此方框边长 50.00mm（输出比例 1:1，不缩放打印）</text>')
+
+    if baseline:
+        pxmm = (baseline["print_w_mm"] / max(1, baseline["image_w_px"]) +
+                baseline["print_h_mm"] / max(1, baseline["image_h_px"])) / 2
+        pw_label = (f'{baseline["print_w_mm"]:.1f}×{baseline["print_h_mm"]:.1f}mm '
+                    f'@ {baseline["image_w_px"]}×{baseline["image_h_px"]}px')
+        src_label = ('显式打印尺寸' if baseline.get("source") == "print_size"
+                     else f'倍率 {baseline.get("magnification", 1):g}×')
+        out.append(f'<text class="sub" x="{bx}" y="{by - 6.4:.2f}">'
+                   f'打印影像基准 {pw_label} · 1px={pxmm:.4f}mm（{src_label}）</text>')
 
     out.append(f'<text class="sub" x="{sheet_w - 8:.2f}" y="{sheet_h - 8:.2f}" '
                f'text-anchor="end">{_esc(project_name)} · 实体遮挡板拼版 · '

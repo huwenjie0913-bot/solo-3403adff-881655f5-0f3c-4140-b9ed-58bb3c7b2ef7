@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS mask_settings (
     project_id  INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
     paper_w     REAL NOT NULL DEFAULT 203,
     paper_h     REAL NOT NULL DEFAULT 254,
+    print_w     REAL NOT NULL DEFAULT 0,   -- 打印影像宽度(mm)，0=按倍率推算
+    print_h     REAL NOT NULL DEFAULT 0,   -- 打印影像高度(mm)
     updated_at  TEXT NOT NULL
 );
 
@@ -102,6 +104,12 @@ def init_db():
     conn = get_db()
     try:
         conn.executescript(SCHEMA)
+        # 旧库迁移：补充明确的打印尺寸基准列
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(mask_settings)")}
+        if "print_w" not in cols:
+            conn.execute("ALTER TABLE mask_settings ADD COLUMN print_w REAL NOT NULL DEFAULT 0")
+        if "print_h" not in cols:
+            conn.execute("ALTER TABLE mask_settings ADD COLUMN print_h REAL NOT NULL DEFAULT 0")
         conn.commit()
     finally:
         conn.close()
@@ -237,21 +245,24 @@ def get_mask_settings(pid):
             "SELECT * FROM mask_settings WHERE project_id=?", (pid,)).fetchone()
         if r:
             return dict(r)
-        return {"project_id": pid, "paper_w": 203.0, "paper_h": 254.0}
+        return {"project_id": pid, "paper_w": 203.0, "paper_h": 254.0,
+                "print_w": 0.0, "print_h": 0.0}
     finally:
         conn.close()
 
 
-def update_mask_settings(pid, paper_w, paper_h):
+def update_mask_settings(pid, paper_w, paper_h, print_w=0.0, print_h=0.0):
     conn = get_db()
     try:
         conn.execute(
-            """INSERT INTO mask_settings (project_id, paper_w, paper_h, updated_at)
-               VALUES (?, ?, ?, ?)
+            """INSERT INTO mask_settings
+                 (project_id, paper_w, paper_h, print_w, print_h, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(project_id) DO UPDATE SET
                  paper_w=excluded.paper_w, paper_h=excluded.paper_h,
+                 print_w=excluded.print_w, print_h=excluded.print_h,
                  updated_at=excluded.updated_at""",
-            (pid, paper_w, paper_h, now()))
+            (pid, paper_w, paper_h, print_w, print_h, now()))
         conn.commit()
     finally:
         conn.close()

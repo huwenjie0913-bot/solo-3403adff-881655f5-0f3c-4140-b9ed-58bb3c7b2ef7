@@ -190,6 +190,36 @@ def main():
     assert f"#{1}" in svg
     print("svg bytes:", len(svg))
 
+    # ---- 显式像素→毫米基准：录入打印影像 320×240mm（无视倍率 2），
+    # 区域多边形 0.2..0.8 → 宽 192mm；SVG 须注明基准，且 1:1 画布宽=板材宽
+    r = c.put(f"/api/projects/{pid}/mask-settings", json={
+        "paper_w": 600, "paper_h": 500, "print_w": 320, "print_h": 240})
+    j = r.get_json()
+    assert j["scale_source"] == "print_size"
+    assert abs(j["paper_mm"][0] - 320) < 1e-9 and abs(j["paper_mm"][1] - 240) < 1e-9
+    assert abs(j["px_per_mm"][0] - 1.0) < 1e-9  # 320px / 320mm
+    regs = c.get(f"/api/projects/{pid}/mask-regions").get_json()
+    r1b = next(x for x in regs["regions"] if x["id"] == "r1")
+    w_mm = max(p["x"] for p in r1b["outer"]) - min(p["x"] for p in r1b["outer"])
+    assert abs(w_mm - 0.6 * 320) < 1e-6, w_mm   # r1: x 0.2..0.8 → 192mm
+    # 重新反算 tid（r1），板宽 = 目标宽 / s(h=200)=1.2
+    rr = c.post(f"/api/mask-tools/{tid}/recalc", json={"height": 200,
+                "sheet_w": 600, "sheet_h": 500}).get_json()
+    bb = rr["result"]["bbox"]
+    # 板宽 = 目标宽 / s，再加羽化内缩补偿（h=200 时 band=7mm，
+    # grow=0.35*7/1.2≈2.04mm，径向外扩近似）→ 约 164mm
+    assert 160.0 < bb["w"] < 165.0, bb
+    svg2 = c.get(f"/projects/{pid}/maskboard.svg?tools={tid}").data.decode()
+    assert 'width="600.0mm" height="500.0mm"' in svg2
+    assert "320.0×240.0mm" in svg2 and "显式打印尺寸" in svg2
+    # 50mm 比例框边长必须是 50 个 SVG 用户单位（=50mm）
+    import re as _re
+    m = _re.search(r'<rect class="frame" x="8(?:\.0+)?" y="[\d.]+" '
+                   r'width="(50(?:\.0+)?)" height="\1"', svg2)
+    assert m, "比例校验框不是 50mm 见方"
+    print("explicit baseline OK:", round(w_mm, 1),
+          "mm target,", round(bb["w"], 1), "mm board")
+
     # 删除工具 / 校准（SET NULL 不应报错）
     assert c.delete(f"/api/mask-tools/{tid}").status_code == 200
     assert c.delete(f"/api/mask-calibrations/{cid}").status_code == 200
