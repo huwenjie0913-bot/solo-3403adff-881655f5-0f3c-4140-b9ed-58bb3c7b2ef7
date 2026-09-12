@@ -123,31 +123,37 @@ def predict(fit, h):
 
 # ---------------------------------------------------------------- 区域 → 毫米轮廓
 
+def has_print_size(project, settings=None):
+    """是否已录入可信的实体尺寸基准（打印影像宽或高至少一个 >0）。"""
+    pw = float((settings or {}).get("print_w") or 0)
+    ph = float((settings or {}).get("print_h") or 0)
+    return pw > 0 or ph > 0
+
+
 def print_size_mm(project, settings=None):
     """像素→毫米的实体换算基准。
 
-    优先使用项目遮挡板设置中显式录入的“打印影像尺寸”(mm)；
-    未录入时回退到 扫描像素 × 放大倍率（旧行为）。
+    仅使用项目遮挡板设置中显式录入的“打印影像尺寸”(mm)：
+    两个尺寸都填则直接采用；只填一个时按扫描宽高比补另一个。
+    注意：不再以“扫描像素 × 放大倍率”充当毫米——倍率无量纲，
+    未录入实体尺寸时返回 source='unset'、尺寸 0，由调用方拦截。
     返回 (print_w_mm, print_h_mm, px_per_mm_x, px_per_mm_y, source)。
     """
     img_w = max(1.0, float(project.get("image_w", 1)))
     img_h = max(1.0, float(project.get("image_h", 1)))
     pw = float((settings or {}).get("print_w") or 0)
     ph = float((settings or {}).get("print_h") or 0)
-    source = "print_size"
     if pw <= 0 and ph <= 0:
-        mag = max(0.01, float(project.get("magnification", 1)))
-        pw, ph = img_w * mag, img_h * mag
-        source = "magnification"
-    elif pw <= 0:          # 只给高：按扫描宽高比补宽
+        return 0.0, 0.0, 0.0, 0.0, "unset"
+    if pw <= 0:            # 只给高：按扫描宽高比补宽
         pw = ph * img_w / img_h
     elif ph <= 0:          # 只给宽：按比补高
         ph = pw * img_h / img_w
-    return pw, ph, img_w / pw, img_h / ph, source
+    return pw, ph, img_w / pw, img_h / ph, "print_size"
 
 
 def paper_size_mm(project, settings=None):
-    """打印影像在相纸上的实体尺寸 (mm)。"""
+    """打印影像在相纸上的实体尺寸 (mm)；未设基准时为 (0, 0)。"""
     pw, ph, _, _, _ = print_size_mm(project, settings)
     return pw, ph
 
@@ -214,7 +220,12 @@ def extract_target_loops(region, project, settings=None, simplify_tol=1.2):
     多边形直接取顶点；画笔先栅格化再边界跟踪成环并化简。
     """
     pw, ph, _, _, scale_source = print_size_mm(project, settings)
-    base = {"print_w_mm": pw, "print_h_mm": ph, "scale_source": scale_source}
+    base = {"print_w_mm": pw, "print_h_mm": ph, "scale_source": scale_source,
+            "scale_ready": scale_source != "unset"}
+    if not base["scale_ready"]:
+        # 没有实体尺寸基准：不产出任何毫米几何，交由调用方拦截
+        return {"outer": [], "holes": [], "area": 0.0,
+                "multiple": False, **base}
     if region.get("kind") != "brush":
         poly = region_to_mm(region, project, settings)
         if len(poly) < 3:
@@ -711,10 +722,10 @@ def validate(spec, calc_result, target, project, paper_w, paper_h,
                        f"超出板材 {sw:g}×{sh:g}mm，或原点不在板内",
             "bbox": bb})
 
-    # 6) 目标落在相纸外（关联区域本身异常）
+    # 6) 目标落在相纸外（关联区域本身异常；无实体基准时跳过）
     pw, ph = paper_size_mm(project, settings)
-    tb = bbox_of([target["outer"]])
-    if tb and (tb["x"] < 0 or tb["y"] < 0 or
+    tb = bbox_of([target["outer"]]) if target.get("outer") else None
+    if pw > 0 and tb and (tb["x"] < 0 or tb["y"] < 0 or
                tb["x"] + tb["w"] > pw + 1e-6 or tb["y"] + tb["h"] > ph + 1e-6):
         issues.append({"kind": "target_off_paper", "severity": "warn",
                        "message": "目标区域超出相纸范围"})

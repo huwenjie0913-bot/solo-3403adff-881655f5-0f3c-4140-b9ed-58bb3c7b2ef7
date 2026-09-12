@@ -38,7 +38,33 @@ def main():
         "magnification": "2", "image": (make_png(), "neg.png")},
         content_type="multipart/form-data")
     pid = r.get_json()["id"]
-    pw, ph = maskboard.paper_size_mm(db.get_project(pid))
+
+    # ---- 未设实体尺寸时：不再以“像素×倍率”冒充毫米，相关操作被拦截
+    assert not maskboard.has_print_size(db.get_project(pid),
+                                        db.get_mask_settings(pid))
+    p0 = maskboard.print_size_mm(db.get_project(pid), db.get_mask_settings(pid))
+    assert p0[:2] == (0.0, 0.0) and p0[4] == "unset", p0
+    blocked = c.get(f"/api/projects/{pid}/mask-regions").get_json()
+    assert blocked["scale_source"] == "unset" and not blocked["scale_ready"]
+    assert blocked["paper_mm"] == [0.0, 0.0]
+    assert all(x["outer"] == [] for x in blocked["regions"])
+    # 建板被拦
+    cid0 = c.post("/api/mask-calibrations", json={
+        "name": "临时", "disc_diameter": 20,
+        "points": [{"h": 100, "pd": 22}, {"h": 300, "pd": 26}]}).get_json()["id"]
+    r = c.post(f"/api/projects/{pid}/mask-tools", json={
+        "region_id": "r1", "calibration_id": cid0, "height": 200})
+    assert r.status_code == 400, r.status_code
+    # SVG 被拦
+    r = c.get(f"/projects/{pid}/maskboard.svg")
+    assert r.status_code == 409, r.status_code
+    c.delete(f"/api/mask-calibrations/{cid0}")
+    print("missing-baseline blocked OK")
+
+    # ---- 录入显式实体尺寸（640×480mm），之后所有毫米几何以此为准
+    c.put(f"/api/projects/{pid}/mask-settings", json={
+        "paper_w": 600, "paper_h": 500, "print_w": 640, "print_h": 480})
+    pw, ph = maskboard.paper_size_mm(db.get_project(pid), db.get_mask_settings(pid))
     assert (pw, ph) == (640.0, 480.0), (pw, ph)
     print("paper mm:", pw, ph)
 
@@ -58,9 +84,10 @@ def main():
     # 页面
     assert c.get(f"/projects/{pid}/maskboard").status_code == 200
     regs = c.get(f"/api/projects/{pid}/mask-regions").get_json()
+    assert regs["scale_ready"] and regs["scale_source"] == "print_size"
     r1 = next(x for x in regs["regions"] if x["id"] == "r1")
     assert len(r1["outer"]) == 4, r1["outer"]
-    # 区域宽 = 0.6*640 = 384mm
+    # 区域宽 = 0.6*640 = 384mm（来自显式尺寸，与倍率无关）
     xs = [p["x"] for p in r1["outer"]]
     assert abs(max(xs) - min(xs) - 384.0) < 1e-6
     print("target contour mm:", r1["outer"][:2])
@@ -219,6 +246,17 @@ def main():
     assert m, "比例校验框不是 50mm 见方"
     print("explicit baseline OK:", round(w_mm, 1),
           "mm target,", round(bb["w"], 1), "mm board")
+
+    # ---- 清空实体尺寸：重新反算与 SVG 再次被拦截，但不回退到像素×倍率
+    c.put(f"/api/projects/{pid}/mask-settings", json={
+        "paper_w": 600, "paper_h": 500, "print_w": 0, "print_h": 0})
+    j = c.get(f"/api/projects/{pid}/mask-regions").get_json()
+    assert j["scale_source"] == "unset" and not j["scale_ready"]
+    assert j["paper_mm"] == [0.0, 0.0]
+    r = c.post(f"/api/mask-tools/{tid2}/recalc", json={"height": 200})
+    assert r.status_code == 400, r.status_code
+    assert c.get(f"/projects/{pid}/maskboard.svg").status_code == 409
+    print("re-cleared baseline blocks recalc/SVG OK")
 
     # 删除工具 / 校准（SET NULL 不应报错）
     assert c.delete(f"/api/mask-tools/{tid}").status_code == 200

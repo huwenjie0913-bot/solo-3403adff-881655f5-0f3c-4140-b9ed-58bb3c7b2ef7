@@ -403,6 +403,7 @@ def api_mask_regions(pid):
     return jsonify({
         "paper_mm": [pw, ph],
         "scale_source": source,
+        "scale_ready": source != "unset",
         "px_per_mm": [pxmm_x, pxmm_y],
         "print_size": [settings.get("print_w") or 0,
                        settings.get("print_h") or 0],
@@ -528,6 +529,10 @@ def api_mask_tool_create(pid):
         return jsonify({"error": "请先选择投影校准"}), 400
     fit = _load_json(cal["fit"], {})
     settings = db.get_mask_settings(pid)
+    if not maskboard.has_print_size(p, settings):
+        return jsonify({"error": "尚未设置打印影像的实体尺寸（mm），"
+                                 "无法按毫米反算遮挡板。请先在左栏填写并保存"
+                                 "“影像宽/高(mm)”。"}), 400
     h = float(data.get("height") or fit.get("h_min") or 10)
     spec = {
         "region_id": region["id"],
@@ -644,6 +649,9 @@ def api_mask_tool_recalc(tid):
     fit = _load_json(cal["fit"], {}) if cal else {}
     settings = db.get_mask_settings(t["project_id"])
     region = _mask_target(plan, spec.get("region_id") or t.get("region_id"))
+    if not maskboard.has_print_size(p, settings):
+        return jsonify({"error": "尚未设置打印影像的实体尺寸（mm），"
+                                 "无法重新反算。请先填写并保存“影像宽/高(mm)”。"}), 400
     # 强制按当前高度/羽化重新反算（放弃轮廓手改），再写回轮廓与默认手柄
     target, pred, calc, issues = _recompute_tool(
         spec, p, region, settings, fit, force_backcalc=True)
@@ -676,6 +684,7 @@ def api_mask_settings(pid):
     pw, ph, pxmm_x, pxmm_y, source = maskboard.print_size_mm(p, new_settings)
     return jsonify({"ok": True,
                     "paper_mm": [pw, ph], "scale_source": source,
+                    "scale_ready": source != "unset",
                     "px_per_mm": [pxmm_x, pxmm_y]})
 
 
@@ -740,6 +749,11 @@ def maskboard_svg(pid):
     if not p:
         abort(404)
     settings = db.get_mask_settings(pid)
+    if not maskboard.has_print_size(p, settings):
+        return Response(
+            "缺少实体尺寸基准：请在遮挡板制作台左栏填写并保存"
+            "“影像宽/高(mm)”后再导出 1:1 SVG。",
+            status=409, mimetype="text/plain; charset=utf-8")
     sheet_w, sheet_h = settings["paper_w"], settings["paper_h"]
     id_param = request.args.get("tools")
     tools_all = db.list_mask_tools(pid)

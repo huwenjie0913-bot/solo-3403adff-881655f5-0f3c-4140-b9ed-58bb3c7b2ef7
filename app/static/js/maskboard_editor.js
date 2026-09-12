@@ -26,7 +26,8 @@ export class MaskBoardApp {
     this.toolVersion = init.tool_version || TOOL_VERSION;
     this.regions = [];
     this.paperMm = {w: 200, h: 250};
-    this.scaleSource = 'magnification';
+    this.scaleSource = 'unset';
+    this.scaleReady = false;
     this.pxPerMm = {x: 1, y: 1};
     this.tools = [];
     this.selTool = null;
@@ -50,9 +51,7 @@ export class MaskBoardApp {
       fetch(`/api/projects/${this.pid}/mask-regions`).then(r => r.json()),
       fetch(`/api/projects/${this.pid}/mask-tools`).then(r => r.json()),
     ]);
-    this.paperMm = {w: rmeta.paper_mm[0], h: rmeta.paper_mm[1]};
-    this.scaleSource = rmeta.scale_source || 'magnification';
-    this.pxPerMm = {x: rmeta.px_per_mm?.[0] || 1, y: rmeta.px_per_mm?.[1] || 1};
+    this.applyScaleMeta(rmeta);
     if (Array.isArray(rmeta.print_size)) {
       this.$('print-w').value = rmeta.print_size[0] || 0;
       this.$('print-h').value = rmeta.print_size[1] || 0;
@@ -123,6 +122,16 @@ export class MaskBoardApp {
     });
 
     this.$('mb-save').onclick = () => { this.save(true); };
+    this.$('mb-export').onclick = e => {
+      if (!this.scaleReady) {
+        e.preventDefault();
+        this.toast('请先填写并保存打印影像的实体尺寸（mm）再导出');
+        this.$('print-w').focus();
+      } else if (!this.tools.length) {
+        e.preventDefault();
+        this.toast('还没有可导出的遮挡板');
+      }
+    };
     this.$('tv-save').onclick = () => this.saveVersion();
     this.$('tv-compare').onclick = () => this.compareVersionsDialog();
   }
@@ -359,6 +368,11 @@ export class MaskBoardApp {
   async createTool() {
     const rid = this.$('region-select').value;
     if (!rid) { this.toast('请选择区域'); return; }
+    if (!this.scaleReady) {
+      this.toast('请先填写并保存打印影像的实体尺寸（mm）');
+      this.$('print-w').focus();
+      return;
+    }
     if (!this.activeCalId) { this.toast('请先选择已保存的投影校准'); return; }
     const region = this.regions.find(r => r.id === rid);
     if (!region || !region.outer || region.outer.length < 3) {
@@ -393,11 +407,24 @@ export class MaskBoardApp {
     this.loadVersions();
   }
 
+  applyScaleMeta(meta) {
+    this.paperMm = {w: meta.paper_mm?.[0] || 0, h: meta.paper_mm?.[1] || 0};
+    this.scaleSource = meta.scale_source || 'unset';
+    this.scaleReady = this.scaleSource !== 'unset';
+    this.pxPerMm = {x: meta.px_per_mm?.[0] || 0, y: meta.px_per_mm?.[1] || 0};
+  }
+
   updatePaperInfo() {
-    const src = this.scaleSource === 'print_size' ? '显式打印尺寸' : '扫描像素×放大倍率';
-    this.$('paper-info').textContent =
+    const el = this.$('paper-info');
+    if (!this.scaleReady) {
+      el.innerHTML = '<strong style="color:var(--warn)">未设置打印影像的实体尺寸。</strong>' +
+        '请在下方填写实际放大后的影像宽/高（mm，至少一个），否则不能建板或导出 1:1 SVG。';
+      return;
+    }
+    el.textContent =
       `打印影像 ${this.paperMm.w.toFixed(1)}×${this.paperMm.h.toFixed(1)}mm · ` +
-      `1px≈${(1 / this.pxPerMm.x).toFixed(3)}mm（${src}）。板材可大于影像；原点在板材左下角。`;
+      `1px≈${(1 / this.pxPerMm.x).toFixed(3)}mm（显式打印尺寸）。` +
+      '板材可大于影像；原点在板材左下角。';
   }
 
   async printSizeChange() {
@@ -409,24 +436,25 @@ export class MaskBoardApp {
         paper_w: +this.$('sh-w').value, paper_h: +this.$('sh-h').value,
         print_w: printW, print_h: printH})});
     const j = await r.json();
-    this.paperMm = {w: j.paper_mm[0], h: j.paper_mm[1]};
-    this.scaleSource = j.scale_source;
-    this.pxPerMm = {x: j.px_per_mm[0], y: j.px_per_mm[1]};
+    this.applyScaleMeta(j);
     this.updatePaperInfo();
+    if (!this.scaleReady) {
+      this.draw();
+      this.toast('已清空实体尺寸；需要重新填写才能建板/导出');
+      return;
+    }
     // 基准变了：目标轮廓必须按新毫米基准重新拉取，再对所有板重算
     await this.reloadRegionsAndTools();
-    this.toast('实体尺度基准已更新，轮廓已按新基准重算');
+    this.toast('实体尺度基准已保存，轮廓已按同一基准重算');
   }
 
   async reloadRegionsAndTools() {
     const meta = await fetch(`/api/projects/${this.pid}/mask-regions`)
       .then(r => r.json());
+    this.applyScaleMeta(meta);
     this.regions = meta.regions;
-    this.paperMm = {w: meta.paper_mm[0], h: meta.paper_mm[1]};
-    this.scaleSource = meta.scale_source;
-    this.pxPerMm = {x: meta.px_per_mm[0], y: meta.px_per_mm[1]};
     this.renderRegionSelect();
-    // 基准变了：所有板按新基准重新反算
+    // 基准变了：所有板按新基准重新反算（服务端会拒绝未设尺寸的情况）
     for (const tt of this.tools) {
       await this.recalcServer(tt, {height: tt.spec.height});
     }
@@ -599,21 +627,22 @@ export class MaskBoardApp {
     this.updateCalInfo();
   }
 
-  recalc() {
+  async recalc() {
     const t = this.tool();
     if (!t) return;
-    const fit = this.currentFit();
-    const region = this.regions.find(r => r.id === (t.spec.region_id || t.region_id));
-    const pred = predict(fit, t.spec.height);
-    if (!pred) { this.toast('当前高度无有效校准'); return; }
-    const calc = backCalc(region, pred, t.spec.feather_comp ?? 0.35);
-    t.spec.outer = calc.board.outer;
-    t.spec.holes = calc.board.holes;
-    const anchor = handleAnchorSuggest(t.spec.outer, t.spec.handle?.dir ?? 0);
-    t.spec.handle = {...(t.spec.handle || {}), ax: anchor.x, ay: anchor.y,
-      dir: t.spec.handle?.dir ?? 0,
-      length: t.spec.handle?.length ?? HANDLE_L,
-      width: t.spec.handle?.width ?? HANDLE_W};
+    if (!this.scaleReady) {
+      this.toast('请先填写并保存打印影像的实体尺寸（mm）');
+      return;
+    }
+    const r = await fetch(`/api/mask-tools/${t.id}/recalc`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({height: t.spec.height})});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { this.toast(j.error || '重新反算失败'); return; }
+    t.spec = j.spec;
+    t.result = {...j.result, target: this.regions.find(
+      x => x.id === (t.spec.region_id || t.region_id))};
+    const anchor = t.spec.handle;
     this.recomputeCurrent();
     this.renderParams();
     this.mark();
@@ -720,16 +749,27 @@ export class MaskBoardApp {
     ctx.setLineDash([6, 4]);
     ctx.strokeRect(p0.x, p0.y - v.sh * v.k, v.sw * v.k, v.sh * v.k);
     ctx.setLineDash([]);
-    // 相纸范围（在板材内左下对齐显示参考）
-    const pw = Math.min(this.paperMm.w, v.sw), ph = Math.min(this.paperMm.h, v.sh);
-    const q0 = this.toScreen({x: 0, y: 0});
-    ctx.fillStyle = COL.paper;
-    ctx.fillRect(q0.x, q0.y - ph * v.k, pw * v.k, ph * v.k);
-    ctx.strokeStyle = 'rgba(120,160,255,.6)';
-    ctx.strokeRect(q0.x, q0.y - ph * v.k, pw * v.k, ph * v.k);
-    ctx.fillStyle = 'rgba(150,170,220,.8)';
+    // 相纸范围（在板材内左下对齐显示参考）；未设实体基准时不画
+    if (this.scaleReady) {
+      const pw = Math.min(this.paperMm.w, v.sw), ph = Math.min(this.paperMm.h, v.sh);
+      const q0 = this.toScreen({x: 0, y: 0});
+      ctx.fillStyle = COL.paper;
+      ctx.fillRect(q0.x, q0.y - ph * v.k, pw * v.k, ph * v.k);
+      ctx.strokeStyle = 'rgba(120,160,255,.6)';
+      ctx.strokeRect(q0.x, q0.y - ph * v.k, pw * v.k, ph * v.k);
+      ctx.fillStyle = 'rgba(150,170,220,.8)';
+      ctx.font = '10px sans-serif';
+      ctx.fillText(`影像 ${pw.toFixed(0)}×${ph.toFixed(0)}mm`, q0.x + 4, q0.y - 4);
+    } else {
+      ctx.fillStyle = '#ffc24d';
+      ctx.font = 'bold 14px sans-serif';
+      ctx.fillText('未设置打印影像的实体尺寸（mm）', 16, 40);
+      ctx.font = '12px sans-serif';
+      ctx.fillStyle = '#cfd2da';
+      ctx.fillText('请在左栏“实体尺度 / 板材”填写影像宽/高并保存后再建板。', 16, 60);
+    }
+    ctx.fillStyle = 'rgba(200,200,210,.7)';
     ctx.font = '10px sans-serif';
-    ctx.fillText(`相纸 ${pw.toFixed(0)}×${ph.toFixed(0)}mm`, q0.x + 4, q0.y - 4);
     ctx.fillText(`板材 ${v.sw}×${v.sh}mm（原点 ◧ 左下）`, p0.x + 4,
                  p0.y - v.sh * v.k + 12);
 
@@ -991,7 +1031,6 @@ export class MaskBoardApp {
     this.$('mb-export').href =
       `/projects/${this.pid}/maskboard.svg${ids.length ? '?tools=' + ids.join(',') : ''}`;
   }
-
   // ------------------------------------------------------------ 版本
   async saveVersion() {
     const t = this.tool();
