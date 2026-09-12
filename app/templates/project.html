@@ -33,23 +33,102 @@
     <div class="kv">底片极性
       <select id="f-invert"><option value="0" {% if not project.negative_invert %}selected{% endif %}>底片扫描（默认）</option>
       <option value="1" {% if project.negative_invert %}selected{% endif %}>正像/反相图</option></select></div>
+    <div class="kv">曝光模式
+      <select id="f-mode">
+        <option value="single">单一反差号</option>
+        <option value="split">分级滤镜（双段）</option>
+      </select></div>
 
-    <h2>相纸响应校准</h2>
-    <p class="muted" style="margin:4px 0">录入阶梯曝光条：每档秒数与在相纸上实测灰度（0=黑，255=白纸）。
-      也可在右侧扫描图上取点。</p>
-    <table class="cal-table" id="cal-table">
-      <thead><tr><th>秒</th><th>灰度</th><th></th></tr></thead>
-      <tbody></tbody>
-    </table>
-    <div class="row">
-      <button id="cal-add">+ 一档</button>
-      <button id="cal-fit" class="primary">拟合曲线</button>
-      <button id="cal-clear">清空</button>
+    <div id="cal-single">
+      <h2>相纸响应校准</h2>
+      <p class="muted" style="margin:4px 0">录入阶梯曝光条：每档秒数与在相纸上实测灰度（0=黑，255=白纸）。
+        也可在右侧扫描图上取点。</p>
+      <table class="cal-table" id="cal-table">
+        <thead><tr><th>秒</th><th>灰度</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="row">
+        <button id="cal-add">+ 一档</button>
+        <button id="cal-fit" class="primary">拟合曲线</button>
+        <button id="cal-clear">清空</button>
+      </div>
+      <canvas id="curve-canvas" width="520" height="260"></canvas>
+      <div id="cal-info" class="muted" style="margin-top:4px"></div>
+      <div class="row muted" style="font-size:11px">
+        <label class="row" style="margin:0"><input type="checkbox" id="eyedrop"> 扫描图取灰度</label>
+      </div>
     </div>
-    <canvas id="curve-canvas" width="520" height="260"></canvas>
-    <div id="cal-info" class="muted" style="margin-top:4px"></div>
-    <div class="row muted" style="font-size:11px">
-      <label class="row" style="margin:0"><input type="checkbox" id="eyedrop"> 扫描图取灰度</label>
+
+    <div id="cal-split" style="display:none">
+      <h2>分级滤镜校准</h2>
+      <p class="muted" style="margin:4px 0">分别对两种滤镜做阶梯曝光：录入每档秒数与实测灰度，
+        各自拟合响应曲线。合成时按两条曲线的净密度贡献叠加。</p>
+      <div class="calfilter" id="calbox-soft">
+        <div class="row" style="margin:2px 0">
+          <strong style="color:var(--soft)">低反差滤镜（#00）</strong>
+          <span class="tag" id="cal-status-soft">未校准</span>
+        </div>
+        <table class="cal-table" id="cal-table-soft">
+          <thead><tr><th>秒</th><th>灰度</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="row">
+          <button id="cal-add-soft">+ 一档</button>
+          <button id="cal-fit-soft" class="primary">拟合</button>
+          <button id="cal-clear-soft">清空</button>
+          <label class="row muted" style="margin:0;font-size:11px">
+            <input type="checkbox" id="eyedrop-soft"> 图上取灰度</label>
+        </div>
+      </div>
+      <div class="calfilter" id="calbox-hard">
+        <div class="row" style="margin:2px 0">
+          <strong style="color:var(--hard)">高反差滤镜（#5）</strong>
+          <span class="tag" id="cal-status-hard">未校准</span>
+        </div>
+        <table class="cal-table" id="cal-table-hard">
+          <thead><tr><th>秒</th><th>灰度</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="row">
+          <button id="cal-add-hard">+ 一档</button>
+          <button id="cal-fit-hard" class="primary">拟合</button>
+          <button id="cal-clear-hard">清空</button>
+          <label class="row muted" style="margin:0;font-size:11px">
+            <input type="checkbox" id="eyedrop-hard"> 图上取灰度</label>
+        </div>
+      </div>
+      <canvas id="curve-canvas-split" width="520" height="240"></canvas>
+
+      <h2>目标灰度 → 两路时长</h2>
+      <p class="muted" style="margin:4px 0">在右侧图上点选代表性高光与阴影，设目标灰度，
+        系统搜索两路基础曝光时长。</p>
+      <div class="kv">高光目标
+        <div class="row" style="margin:0">
+          <button id="pick-hi">点选</button>
+          <input type="number" id="tgt-hi" min="1" max="255" step="1" value="220" style="width:58px">
+          <span class="muted" id="pick-hi-pos">未选点</span>
+        </div></div>
+      <div class="kv">阴影目标
+        <div class="row" style="margin:0">
+          <button id="pick-sh">点选</button>
+          <input type="number" id="tgt-sh" min="1" max="255" step="1" value="35" style="width:58px">
+          <span class="muted" id="pick-sh-pos">未选点</span>
+        </div></div>
+      <div class="row">
+        <button id="solve-split" class="primary">按目标求解两路时长</button>
+        <button id="solve-clear" title="清除目标点">清除目标</button>
+      </div>
+      <div class="kv">低反差(s)
+        <div class="row" style="margin:0">
+          <input type="number" id="t-soft" step="0.1" min="0.2" max="600" style="width:64px">
+          <input type="range" id="t-soft-r" min="0.2" max="120" step="0.1" style="flex:1">
+        </div></div>
+      <div class="kv">高反差(s)
+        <div class="row" style="margin:0">
+          <input type="number" id="t-hard" step="0.1" min="0.2" max="600" style="width:64px">
+          <input type="range" id="t-hard-r" min="0.2" max="120" step="0.1" style="flex:1">
+        </div></div>
+      <div class="muted" id="split-info" style="font-size:11px"></div>
     </div>
 
     <h2>区域 / 工具</h2>
@@ -73,6 +152,8 @@
     <div style="position:absolute;left:10px;top:8px;z-index:20" class="row">
       <div class="seg" id="view-mode">
         <button data-mode="final" class="on">最终灰度</button>
+        <button data-mode="soft" class="split-only" style="display:none">低反差贡献</button>
+        <button data-mode="hard" class="split-only" style="display:none">高反差贡献</button>
         <button data-mode="delta">增减效果</button>
         <button data-mode="base">基础</button>
         <button data-mode="mask">遮罩</button>
@@ -113,11 +194,12 @@
       <div class="tl-lane tl-base" id="lane-base" style="top:4px"></div>
       <div class="tl-lane" id="lane-dodge" style="top:42px"></div>
       <div class="tl-lane" id="lane-burn" style="top:80px"></div>
+      <div class="tl-swap" id="tl-swap" style="display:none"><span>换片</span></div>
       <div class="tl-cursor" id="tl-cursor" style="display:none"></div>
       <div class="tl-ticks" id="tl-ticks"></div>
       <div class="tl-label" style="top:4px">基础</div>
-      <div class="tl-label" style="top:42px">遮挡（基础段内）</div>
-      <div class="tl-label" style="top:80px">加光（基础后/分段）</div>
+      <div class="tl-label" style="top:42px">遮挡（段内）</div>
+      <div class="tl-label" style="top:80px">加光（段内/段后）</div>
     </div>
   </div>
 </div>

@@ -1,14 +1,24 @@
 // app.js —— 工作台主控
-import {compute, fitCurve, defaultParams, intervalsOf, regionSignature} from './engine.js';
+import {compute, fitCurve, defaultParams, intervalsOf, regionSignature,
+        splitEnabled, splitTimes, splitSegments, splitIntervals, stepFilter,
+        solveSplitTimes, SPLIT_GRADES} from './engine.js';
 
 const GRID = 480;                 // 计算栅格最长边
 const PALETTE = ['#ff8c1a', '#50aaff', '#b4ff50', '#ff5ac8', '#b478ff', '#3cdcc8'];
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 
 export class App {
   constructor(pid) {
     this.pid = pid;
-    this.plan = {regions: [], steps: [], base_exposure: 10};
+    this.plan = {regions: [], steps: [], base_exposure: 10,
+                 split: {enabled: false, t_soft: 10, t_hard: 10,
+                         targets: {highlight: null, shadow: null}}};
     this.cal = {params: defaultParams(2), calibrated: false};
+    // 分级滤镜两路校准（各自独立拟合）
+    this.calS = {
+      soft: {params: defaultParams(0), points: [], calibrated: false},
+      hard: {params: defaultParams(5), points: [], calibrated: false},
+    };
     this.meta = {};
     this.selRegion = null;
     this.selStep = null;
@@ -18,6 +28,7 @@ export class App {
     this.showMask = true;
     this.drawing = null;         // 当前笔画
     this.draft = null;           // 多边形草稿点
+    this.pickMode = null;        // 'highlight' | 'shadow' | null（目标点选）
     this.scrubT = null;
     this.tmax = 30;
     this.maskCache = {};
@@ -36,8 +47,21 @@ export class App {
     this.plan = Object.assign({regions: [], steps: [], base_exposure: p.base_exposure},
                               p.plan || {});
     this.plan.base_exposure = +this.plan.base_exposure || p.base_exposure;
+    // 分级滤镜计划数据（旧方案缺省关闭，行为不变）
+    this.plan.split = Object.assign(
+      {enabled: false, t_soft: 10, t_hard: 10,
+       targets: {highlight: null, shadow: null}},
+      this.plan.split || {});
+    this.plan.split.targets = Object.assign(
+      {highlight: null, shadow: null}, this.plan.split.targets || {});
     this.cal = p.calibration && p.calibration.params ? p.calibration
                : {params: defaultParams(p.paper_grade), calibrated: false};
+    const sc = (p.calibration && p.calibration.split) || {};
+    for (const f of ['soft', 'hard']) {
+      if (sc[f] && sc[f].params) this.calS[f] =
+        Object.assign({points: [], calibrated: false}, sc[f]);
+      this.calS[f].points = this.calS[f].points || [];
+    }
     this.$('proj-name').value = p.name;
     this.$('f-mag').value = p.magnification;
     this.$('f-apt').value = p.aperture;
@@ -46,8 +70,16 @@ export class App {
     this.$('f-invert').value = p.negative_invert;
     this.calPoints = this.cal.points || [];
     this.syncCalTable();
+    this.syncCalTableSplit('soft');
+    this.syncCalTableSplit('hard');
     this.drawCurve();
+    this.drawCurveSplit();
     this.updateCalStatus();
+    this.updateCalStatusSplit('soft');
+    this.updateCalStatusSplit('hard');
+    this.applyModeUI();
+    this.syncSplitInputs();
+    this.syncTargetUI();
 
     await this.loadImage(p.image_path, +p.negative_invert);
     this.layoutCanvases();
@@ -58,6 +90,8 @@ export class App {
     setInterval(() => this.autosave(), 1500);
     window.addEventListener('beforeunload', () => this.autosave(true));
   }
+
+  splitMode() { return !!this.plan.split.enabled; }
 
   // ------------------------------------------------------------ 图像载入
   async loadImage(src, invert) {
@@ -153,6 +187,61 @@ export class App {
       this.$('crosshair').style.cursor = e.target.checked ? 'crosshair' : '';
     };
 
+    // 曝光模式：单一反差号 / 分级滤镜
+    this.$('f-mode').onchange = e => {
+      this.plan.split.enabled = e.target.value === 'split';
+      this.applyModeUI();
+      this.clampSteps();
+      this.recompute(true);
+      this.mark();
+    };
+
+    // 分级滤镜：两路校准
+    for (const f of ['soft', 'hard']) {
+      this.$(`cal-add-${f}`).onclick = () => {
+        const pts = this.calS[f].points;
+        const last = pts[pts.length - 1];
+        pts.push({t: last ? +(last.t * 2).toFixed(1) : 4, gray: 180});
+        this.syncCalTableSplit(f); this.mark();
+      };
+      this.$(`cal-fit-${f}`).onclick = () => this.doFitSplit(f);
+      this.$(`cal-clear-${f}`).onclick = () => {
+        this.calS[f] = {params: defaultParams(SPLIT_GRADES[f]), points: [],
+                        calibrated: false};
+        this.syncCalTableSplit(f); this.drawCurveSplit();
+        this.updateCalStatusSplit(f);
+        this.recompute(); this.mark();
+      };
+      this.$(`eyedrop-${f}`).onchange = e => {
+        if (e.target.checked) {
+          this.$(`eyedrop-${f === 'soft' ? 'hard' : 'soft'}`).checked = false;
+          this.$('crosshair').style.cursor = 'crosshair';
+        } else {
+          this.$('crosshair').style.cursor = '';
+        }
+      };
+    }
+
+    // 目标点选与求解
+    this.$('pick-hi').onclick = () => this.armPick('highlight');
+    this.$('pick-sh').onclick = () => this.armPick('shadow');
+    this.$('tgt-hi').onchange = e => this.setTargetGray('highlight', +e.target.value);
+    this.$('tgt-sh').onchange = e => this.setTargetGray('shadow', +e.target.value);
+    this.$('solve-split').onclick = () => this.solveSplit();
+    this.$('solve-clear').onclick = () => {
+      this.plan.split.targets = {highlight: null, shadow: null};
+      this.syncTargetUI(); this.recompute(); this.mark();
+    };
+    // 两路时长细调（数字框 + 滑块）
+    this.$('t-soft').onchange = e =>
+      this.applySplitTimes(+e.target.value || 10, this.plan.split.t_hard);
+    this.$('t-hard').onchange = e =>
+      this.applySplitTimes(this.plan.split.t_soft, +e.target.value || 10);
+    this.$('t-soft-r').oninput = e =>
+      this.applySplitTimes(+e.target.value, this.plan.split.t_hard);
+    this.$('t-hard-r').oninput = e =>
+      this.applySplitTimes(this.plan.split.t_soft, +e.target.value);
+
     // 工具
     this.$('tool-brush').onclick = () => this.setTool('brush');
     this.$('tool-poly').onclick = () => this.setTool('poly');
@@ -219,6 +308,22 @@ export class App {
     if (p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1) return;
     this.$('stage').focus();
 
+    if (this.pickMode) {
+      // 目标点选：记录代表性高光/阴影点位
+      const key = this.pickMode;
+      const gray = +(key === 'highlight' ? this.$('tgt-hi').value
+                     : this.$('tgt-sh').value) || 128;
+      this.plan.split.targets[key] = {x: +p.x.toFixed(4), y: +p.y.toFixed(4),
+                                      gray};
+      this.pickMode = null;
+      this.$('stage').style.cursor = '';
+      this.syncTargetUI();
+      this.recompute();
+      this.mark();
+      this.toast(key === 'highlight' ? '已记录高光目标点' : '已记录阴影目标点');
+      return;
+    }
+
     if (this.$('eyedrop').checked) {
       const g = Math.round(this.sampleGray(p));
       const last = this.calPoints[this.calPoints.length - 1];
@@ -226,6 +331,19 @@ export class App {
       this.syncCalTable();
       this.toast(`已取灰度 ${g}`);
       return;
+    }
+
+    // 分级滤镜：向当前滤镜的校准表取灰度
+    for (const f of ['soft', 'hard']) {
+      if (this.splitMode() && this.$(`eyedrop-${f}`).checked) {
+        const g = Math.round(this.sampleGray(p));
+        const pts = this.calS[f].points;
+        const last = pts[pts.length - 1];
+        pts.push({t: last ? +(last.t * 1.5).toFixed(1) : 4, gray: g});
+        this.syncCalTableSplit(f);
+        this.toast(`已取灰度 ${g} → ${f === 'soft' ? '低反差' : '高反差'}表`);
+        return;
+      }
     }
 
     if (this.tool === 'brush') {
@@ -365,7 +483,12 @@ export class App {
       id: 's' + (Math.max(0, ...this.plan.steps.map(x => +x.id.slice(1))) + 1),
       type, region_id: this.selRegion,
     };
-    if (type === 'dodge') { s.start = 0; s.ratio = 0.4; }
+    if (this.splitMode()) {
+      // 分级滤镜：遮挡默认护高光（软段），加光默认塑阴影（硬段）
+      const [tSoft, tHard] = splitTimes(this.plan);
+      if (type === 'dodge') { s.filter = 'soft'; s.start = 0; s.ratio = 0.4; }
+      else { s.filter = 'hard'; s.start = tSoft + tHard; s.stops = 1; }
+    } else if (type === 'dodge') { s.start = 0; s.ratio = 0.4; }
     else { s.start = base; s.stops = 1; }
     this.plan.steps.push(s);
     this.selStep = s.id;

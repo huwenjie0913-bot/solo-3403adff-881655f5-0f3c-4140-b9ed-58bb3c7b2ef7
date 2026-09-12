@@ -39,8 +39,12 @@ def load_cal(p):
         cal = json.loads(p.get("calibration") or "{}")
     except json.JSONDecodeError:
         cal = {}
-    return engine.normalize_calibration(cal, p.get("paper_grade", 2),
-                                        p.get("base_exposure", 10))
+    cal = engine.normalize_calibration(cal, p.get("paper_grade", 2),
+                                       p.get("base_exposure", 10))
+    # 分级滤镜两条曲线同样归一化（无数据时给 00/5 号默认曲线）
+    soft, hard = engine.normalize_split(cal)
+    cal["split"] = {"soft": soft, "hard": hard}
+    return cal
 
 
 @app.after_request
@@ -146,9 +150,15 @@ def serve_image(fname):
 @app.route("/api/calibrate", methods=["POST"])
 def api_calibrate():
     data = request.get_json(force=True)
+    # filter=soft/hard 时按分级滤镜默认反差号取初值（00 号 / 5 号）
+    filt = data.get("filter")
+    if filt in engine.SPLIT_GRADES:
+        grade = engine.SPLIT_GRADES[filt]
+    else:
+        grade = int(data.get("paper_grade", 2))
     result = engine.fit_curve(
         data.get("points", []),
-        grade=int(data.get("paper_grade", 2)),
+        grade=grade,
         base_exposure=float(data.get("base_exposure", 10)),
     )
     out = {
@@ -161,6 +171,20 @@ def api_calibrate():
         "calibrated": result["n"] >= 2 and result["rms"] is not None,
     }
     return jsonify(out)
+
+
+@app.route("/api/split-solve", methods=["POST"])
+def api_split_solve():
+    """搜索分级滤镜两路基础曝光时长（供前端以外的校验/导出使用）。"""
+    data = request.get_json(force=True)
+    cal = data.get("calibration") or {}
+    soft, hard = engine.normalize_split(cal)
+    ps, ph = soft["params"], hard["params"]
+    base_ref = max(float(data.get("base_exposure", 10)), 0.01)
+    sol = engine.solve_split_exposures(
+        ps, ph, ps["Dmin"], data.get("targets", []), base_ref,
+        t_soft0=data.get("t_soft"), t_hard0=data.get("t_hard"))
+    return jsonify(sol)
 
 
 # ---------------------------------------------------------------- compute
@@ -185,12 +209,20 @@ def api_compute(pid):
     H, W = res["gray"].shape
     step = max(1, round(max(H, W) / 480))
     gray = res["gray"][::step, ::step]
-    return jsonify({
+    out = {
         "gray": np.round(gray).astype(np.uint8).tolist(),
         "warnings": res["warnings"],
         "timeline_end": res["timeline_end"],
         "intervals": res["intervals"],
-    })
+    }
+    if engine.split_enabled(plan):
+        out["segments"] = res["segments"]
+        out["swap_t"] = res["swap_t"]
+        out["gray_soft"] = np.round(
+            res["gray_soft"][::step, ::step]).astype(np.uint8).tolist()
+        out["gray_hard"] = np.round(
+            res["gray_hard"][::step, ::step]).astype(np.uint8).tolist()
+    return jsonify(out)
 
 
 # ---------------------------------------------------------------- versions
@@ -233,6 +265,8 @@ def api_restore_version(vid):
 
 def _stopwatch_nodes(plan, intervals, total):
     """生成秒表节点：每一步开始/结束的累计时刻 + 动作。"""
+    if engine.split_enabled(plan):
+        return _stopwatch_nodes_split(plan, total)
     base = max(float(plan.get("base_exposure", 10)), 0.01)
     nodes = [(0.0, "开始基础曝光（镜头下全部区域）")]
     acts = []
@@ -254,6 +288,37 @@ def _stopwatch_nodes(plan, intervals, total):
     for a, b, text in sorted(acts, key=lambda z: z[0]):
         nodes.append((round(a, 1), text + " —— 开始"))
         nodes.append((round(b, 1), text + " —— 结束"))
+    nodes.append((round(total, 1), "结束 / 移开相纸"))
+    nodes.sort(key=lambda z: z[0])
+    return nodes
+
+
+def _stopwatch_nodes_split(plan, total):
+    """分级滤镜秒表：两个连续曝光段 + 换片节点。"""
+    t_soft, t_hard = engine.split_times(plan)
+    segs = dict((f, (a, b)) for f, a, b in engine.split_segments(plan))
+    regions = {r["id"]: r for r in plan.get("regions", [])}
+    nodes = [(0.0, "装上低反差滤镜（#00），开始第一段曝光（镜头下全部区域）")]
+    acts = []
+    for s, f, a, b in engine.split_intervals(plan):
+        reg = regions.get(s.get("region_id"), {})
+        nm = reg.get("name", "未命名区域")
+        dur = b - a
+        if s.get("type") == "dodge":
+            tool_sz = reg.get("size", 0) or 0
+            tool_desc = (f"{tool_sz:.0f}px 工具，" if reg.get("kind") == "brush"
+                         else "多边形板，")
+            acts.append((a, b, f"遮挡：{nm}（{tool_desc}持续 {dur:.1f}s）", f))
+        else:
+            acts.append((a, b, f"加光：{nm}（+{s.get('stops',0):g} 档，"
+                              f"持续 {dur:.1f}s）", f))
+    for a, b, text, f in sorted(acts, key=lambda z: z[0]):
+        seg = "低反差段" if f == "soft" else "高反差段"
+        nodes.append((round(a, 1), f"[{seg}] " + text + " —— 开始"))
+        nodes.append((round(b, 1), f"[{seg}] " + text + " —— 结束"))
+    nodes.append((round(t_soft, 1),
+                  "换片：取下低反差滤镜（#00），装上高反差滤镜（#5），"
+                  "开始第二段曝光"))
     nodes.append((round(total, 1), "结束 / 移开相纸"))
     nodes.sort(key=lambda z: z[0])
     return nodes
@@ -292,31 +357,57 @@ def print_sheet(pid):
     fitted = cal.get("fitted", [])
 
     nodes = _stopwatch_nodes(plan, res["intervals"], res["timeline_end"])
-    base_exp = max(float(plan.get("base_exposure", 10)), 0.01)
+    is_split = engine.split_enabled(plan)
     rows = []
-    for s in plan.get("steps", []):
-        reg = regions.get(s.get("region_id"), {})
-        if s["type"] == "dodge":
-            dur = base_exp * float(s.get("ratio", 0))
-            rows.append({"n": len(rows) + 1, "type": "遮挡",
+    if is_split:
+        segs = dict((f, (a, b)) for f, a, b in engine.split_segments(plan))
+        for s, f, a, b in engine.split_intervals(plan):
+            reg = regions.get(s.get("region_id"), {})
+            dur = b - a
+            rows.append({"n": len(rows) + 1,
+                         "type": "遮挡" if s["type"] == "dodge" else "加光",
+                         "filter": "低反差" if f == "soft" else "高反差",
                          "region": reg.get("name", "?"),
-                         "start": float(s.get("start", 0)), "dur": dur,
-                         "param": f"遮挡 {float(s.get('ratio',0))*100:.0f}%",
+                         "start": a, "dur": dur,
+                         "param": (f"遮挡 {float(s.get('ratio',0))*100:.0f}%"
+                                   if s["type"] == "dodge"
+                                   else f"+{s.get('stops',0):g} 档"),
                          "feather": reg.get("feather", 0),
                          "size": reg.get("size", 0),
                          "kind": reg.get("kind"),
-                         "end": float(s.get("start", 0)) + dur})
-        else:
-            extra = base_exp * (2.0 ** float(s.get("stops", 0)) - 1.0)
-            t0 = float(s.get("start", base_exp))
-            rows.append({"n": len(rows) + 1, "type": "加光",
-                         "region": reg.get("name", "?"),
-                         "start": t0, "dur": extra,
-                         "param": f"+{s.get('stops',0):g} 档",
-                         "feather": reg.get("feather", 0),
-                         "size": reg.get("size", 0),
-                         "kind": reg.get("kind"),
-                         "end": t0 + extra})
+                         "end": b})
+        t_soft, t_hard = engine.split_times(plan)
+        split_info = {
+            "t_soft": t_soft, "t_hard": t_hard, "swap_t": t_soft,
+            "end": res["timeline_end"],
+            "segments": engine.split_segments(plan),
+        }
+    else:
+        split_info = None
+        base_exp = max(float(plan.get("base_exposure", 10)), 0.01)
+        for s in plan.get("steps", []):
+            reg = regions.get(s.get("region_id"), {})
+            if s["type"] == "dodge":
+                dur = base_exp * float(s.get("ratio", 0))
+                rows.append({"n": len(rows) + 1, "type": "遮挡",
+                             "region": reg.get("name", "?"),
+                             "start": float(s.get("start", 0)), "dur": dur,
+                             "param": f"遮挡 {float(s.get('ratio',0))*100:.0f}%",
+                             "feather": reg.get("feather", 0),
+                             "size": reg.get("size", 0),
+                             "kind": reg.get("kind"),
+                             "end": float(s.get("start", 0)) + dur})
+            else:
+                extra = base_exp * (2.0 ** float(s.get("stops", 0)) - 1.0)
+                t0 = float(s.get("start", base_exp))
+                rows.append({"n": len(rows) + 1, "type": "加光",
+                             "region": reg.get("name", "?"),
+                             "start": t0, "dur": extra,
+                             "param": f"+{s.get('stops',0):g} 档",
+                             "feather": reg.get("feather", 0),
+                             "size": reg.get("size", 0),
+                             "kind": reg.get("kind"),
+                             "end": t0 + extra})
 
     return render_template(
         "print_sheet.html", p=p, plan=plan, cal=cal,
@@ -324,6 +415,7 @@ def print_sheet(pid):
         warnings=res["warnings"], thumbs=thumbs,
         result_img=result_img, base_img=base_img,
         nodes=nodes, rows=rows, total=res["timeline_end"],
+        is_split=is_split, split_info=split_info,
         now_ts=db.now())
 
 
@@ -342,6 +434,13 @@ def export_json(pid):
         "warnings": res["warnings"],
         "exported_at": db.now(),
     }
+    if engine.split_enabled(plan):
+        payload["split"] = {
+            "t_soft": res["swap_t"],
+            "t_hard": engine.split_times(plan)[1],
+            "segments": res["segments"],
+            "timeline_end": res["timeline_end"],
+        }
     resp = Response(json.dumps(payload, ensure_ascii=False, indent=2),
                     mimetype="application/json")
     resp.headers["Content-Disposition"] = (

@@ -188,6 +188,400 @@ export function regionSignature(r) {
                          r.points || [], r.strokes || []]);
 }
 
+// ------------------------------------------------------------------ split-grade
+// 分级滤镜：同一张相纸先低反差（软）后高反差（硬）两段曝光，
+// 总密度 = 纸基 Dmin + 两段各自的净密度贡献（logistic − Dmin）。
+export const SPLIT_GRADES = {soft: 0, hard: 5};
+export const SPLIT_T_MIN = 0.2, SPLIT_T_MAX = 600;
+
+export function splitEnabled(plan) {
+  return !!(plan && plan.split && plan.split.enabled);
+}
+
+export function normalizeSplit(cal) {
+  const sc = (cal && cal.split) || {};
+  const norm = (c, grade) => {
+    c = c || {};
+    if (c.params) return c;
+    return {...c, params: defaultParams(grade), calibrated: false};
+  };
+  return [norm(sc.soft, SPLIT_GRADES.soft), norm(sc.hard, SPLIT_GRADES.hard)];
+}
+
+export function stepFilter(s) {
+  // 缺省按暗房习惯：遮挡护高光→软段，加光塑阴影→硬段
+  if (s.filter === 'soft' || s.filter === 'hard') return s.filter;
+  return s.type === 'dodge' ? 'soft' : 'hard';
+}
+
+export function splitTimes(plan) {
+  const sp = (plan && plan.split) || {};
+  const t = v => clamp(+v || 10, 0.05, 600);
+  return [t(sp.t_soft), t(sp.t_hard)];
+}
+
+export function splitSegments(plan) {
+  const [ts, th] = splitTimes(plan);
+  return [['soft', 0, ts], ['hard', ts, ts + th]];
+}
+
+export function splitIntervals(plan) {
+  const segs = {};
+  for (const [f, a, b] of splitSegments(plan)) segs[f] = [a, b];
+  const out = [];
+  for (const s of plan.steps || []) {
+    const f = stepFilter(s);
+    const [seg0, seg1] = segs[f];
+    const tSeg = Math.max(seg1 - seg0, 0.01);
+    if (s.type === 'dodge') {
+      const dur = tSeg * clamp(+s.ratio || 0, 0, 1);
+      const a = Math.min(Math.max(+s.start || 0, seg0), seg0 + tSeg - dur);
+      out.push({s, f, a, b: a + dur});
+    } else {
+      const dur = tSeg * (2 ** (+s.stops || 0) - 1);
+      const a = Math.max(s.start === null || s.start === undefined ? seg1
+                         : +s.start, seg0);
+      out.push({s, f, a, b: a + dur});
+    }
+  }
+  return out;
+}
+
+// logistic 精确反解（split 新模型；单曲线旧公式保持不动）
+function invertX(baseGray, W, H, p) {
+  const xPix = new Float64Array(W * H);
+  const span = p.Dmax - p.Dmin;
+  for (let i = 0; i < W * H; i++) {
+    const D = -Math.log10(clamp(baseGray[i], 1, 255) / 255);
+    const ratio = clamp((D - p.Dmin) / span, 1e-6, 1 - 1e-6);
+    xPix[i] = p.x0 - Math.log10(1 / ratio - 1) / p.k;
+  }
+  return xPix;
+}
+
+function netDensity1(x, p) {
+  // 单点净密度贡献：logistic(x) − Dmin（直接求值，尾部不截断）
+  const z = 10 ** clamp(-p.k * (x - p.x0), -300, 300);
+  return (p.Dmax - p.Dmin) / (1 + z);
+}
+
+function logisticDeriv(x, p) {
+  const z = 10 ** clamp(-p.k * (x - p.x0), -300, 300);
+  const sig = 1 / (1 + z);
+  return (p.Dmax - p.Dmin) * LN10 * p.k * sig * (1 - sig);
+}
+
+export function computeSplit(baseGray, W, H, plan, cal, maskCache, time) {
+  const [calSoft, calHard] = normalizeSplit(cal);
+  const ps = calSoft.params, ph = calHard.params;
+  const dminRef = ps.Dmin;
+  const [tSoft, tHard] = splitTimes(plan);
+  const baseRef = Math.max(+plan.base_exposure || 10, 0.01);
+  const xPix = invertX(baseGray, W, H, ps);
+
+  const intervals = splitIntervals(plan);
+  const masks = {};
+  const scrub = time !== null && time !== undefined;
+  // 两路曝光能量（段基础曝光为 1；擦洗时按已流逝比例）
+  const multS = new Float64Array(W * H);
+  const multH = new Float64Array(W * H);
+  multS.fill(scrub ? clamp(time, 0, tSoft) / tSoft : 1);
+  multH.fill(scrub ? clamp(time - tSoft, 0, tHard) / tHard : 1);
+
+  for (const {s, f, a, b} of intervals) {
+    const rid = s.region_id;
+    const reg = regionById(plan, rid);
+    if (!reg) continue;
+    let cov;
+    if (maskCache && maskCache[rid] && maskCache[rid].sig === regionSignature(reg)) {
+      cov = maskCache[rid].data;
+    } else {
+      cov = rasterize(reg, W, H);
+      if (maskCache) maskCache[rid] = {sig: regionSignature(reg), data: cov};
+    }
+    masks[rid] = cov;
+    const tSeg = f === 'soft' ? tSoft : tHard;
+    let d;
+    if (scrub) {
+      d = Math.max(0, Math.min(b, time) - Math.max(a, 0)) / tSeg;
+    } else {
+      d = (b - a) / tSeg;
+    }
+    const tgt = f === 'soft' ? multS : multH;
+    if (s.type === 'dodge') {
+      for (let i = 0; i < W * H; i++) tgt[i] -= d * cov[i];
+    } else {
+      for (let i = 0; i < W * H; i++) tgt[i] += d * cov[i];
+    }
+  }
+
+  const N = W * H;
+  const logEs = new Float64Array(N), logEh = new Float64Array(N);
+  const gray = new Float32Array(N);
+  const grayS = new Float32Array(N), grayH = new Float32Array(N);
+  const ls0 = Math.log10(tSoft / baseRef), lh0 = Math.log10(tHard / baseRef);
+  for (let i = 0; i < N; i++) {
+    const xs = xPix[i] + ls0 + Math.log10(Math.max(multS[i], 1e-6));
+    const xh = xPix[i] + lh0 + Math.log10(Math.max(multH[i], 1e-6));
+    logEs[i] = xs; logEh[i] = xh;
+    const ns = netDensity1(xs, ps), nh = netDensity1(xh, ph);
+    gray[i] = clamp(255 * 10 ** -(dminRef + ns + nh), 0, 255);
+    grayS[i] = clamp(255 * 10 ** -(dminRef + ns), 0, 255);
+    grayH[i] = clamp(255 * 10 ** -(dminRef + nh), 0, 255);
+  }
+  const end = Math.max(tSoft + tHard, ...intervals.map(v => v.b));
+  const logE = new Float32Array(N);
+  for (let i = 0; i < N; i++) logE[i] = Math.min(logEs[i], logEh[i]);
+
+  const res = {gray, graySoft: grayS, grayHard: grayH, logE,
+               logESoft: logEs, logEHard: logEh, grayBase: baseGray,
+               masks, intervals, segments: splitSegments(plan),
+               swapT: tSoft, timelineEnd: end, warnings: [], contours: [], W, H};
+  res.warnings = scrub ? [] : detectSplit(res, plan, cal, calSoft, calHard);
+  res.contours = extractContours(gray, W, H);
+  return res;
+}
+
+// 搜索两路基础曝光时长，使目标点达到目标灰度（阻尼牛顿 + 界限回退）
+export function solveSplitTimes(ps, ph, dminRef, targets, baseRef,
+                                tSoft0 = 10, tHard0 = 10) {
+  const pts = targets.filter(t => t).map(t => ({
+    aS: +t.x_pix + Math.log10(Math.max(+t.m_soft || 1, 1e-6) / baseRef),
+    aH: +t.x_pix + Math.log10(Math.max(+t.m_hard || 1, 1e-6) / baseRef),
+    dt: Math.log10(255 / clamp(+t.gray || 128, 1, 255)) - dminRef,
+  }));
+  if (!pts.length) return {t_soft: tSoft0, t_hard: tHard0, ok: false,
+                           residual: null, unreachable: []};
+  const loU = Math.log10(SPLIT_T_MIN), hiU = Math.log10(SPLIT_T_MAX);
+  const unreachable = [];
+  pts.forEach((q, i) => {
+    const netMax = netDensity1(q.aS + hiU, ps) + netDensity1(q.aH + hiU, ph);
+    const netMin = netDensity1(q.aS + loU, ps) + netDensity1(q.aH + loU, ph);
+    if (q.dt < netMin - 1e-9 || q.dt > netMax + 1e-9) unreachable.push(i);
+  });
+  const resid = (u, v) => pts.map(q =>
+    netDensity1(q.aS + u, ps) + netDensity1(q.aH + v, ph) - q.dt);
+  let u = Math.log10(clamp(tSoft0, SPLIT_T_MIN, SPLIT_T_MAX));
+  let v = Math.log10(clamp(tHard0, SPLIT_T_MIN, SPLIT_T_MAX));
+  let ok = false, r = resid(u, v);
+  if (pts.length === 1) {
+    for (let it = 0; it < 80; it++) {
+      r = resid(u, v);
+      if (Math.abs(r[0]) < 1e-5) { ok = true; break; }
+      const d = logisticDeriv(pts[0].aS + u, ps);
+      if (d < 1e-9) break;
+      u = clamp(u - r[0] / d, loU, hiU);
+    }
+    r = resid(u, v);
+  } else {
+    for (let it = 0; it < 80; it++) {
+      r = resid(u, v);
+      if (Math.max(Math.abs(r[0]), Math.abs(r[1])) < 1e-5) { ok = true; break; }
+      const j11 = logisticDeriv(pts[0].aS + u, ps);
+      const j12 = logisticDeriv(pts[0].aH + v, ph);
+      const j21 = logisticDeriv(pts[1].aS + u, ps);
+      const j22 = logisticDeriv(pts[1].aH + v, ph);
+      const det = j11 * j22 - j12 * j21;
+      if (Math.abs(det) < 1e-12) break;
+      const du = (r[0] * j22 - r[1] * j12) / det;
+      const dv = (j11 * r[1] - j21 * r[0]) / det;
+      let improved = false;
+      for (const damp of [1, 0.5, 0.25, 0.1]) {
+        const nu = clamp(u - damp * du, loU, hiU);
+        const nv = clamp(v - damp * dv, loU, hiU);
+        const nr = resid(nu, nv);
+        if (Math.max(Math.abs(nr[0]), Math.abs(nr[1])) <
+            Math.max(Math.abs(r[0]), Math.abs(r[1]))) {
+          u = nu; v = nv; improved = true; break;
+        }
+      }
+      if (!improved) break;
+    }
+    r = resid(u, v);
+    ok = Math.max(Math.abs(r[0]), Math.abs(r[1])) < 1e-3;
+  }
+  return {t_soft: +(10 ** u).toFixed(2), t_hard: +(10 ** v).toFixed(2),
+          ok: ok && !unreachable.length,
+          residual: Math.max(...r.map(Math.abs)), unreachable};
+}
+
+function detectSplit(res, plan, cal, calSoft, calHard) {
+  const warns = [];
+  const {W, H} = res;
+  const total = W * H;
+  const tSwap = res.swapT;
+  const segs = {};
+  for (const [f, a, b] of res.segments) segs[f] = [a, b];
+
+  // 1) 校准点不足
+  for (const [f, c, label] of [['soft', calSoft, '低反差'],
+                               ['hard', calHard, '高反差']]) {
+    const n = c.n || (c.points || []).length;
+    if (n < 2)
+      warns.push({kind: 'split_cal', severity: 'error',
+        message: `${label}滤镜校准点不足（${n}/2）：请录入阶梯曝光并拟合后再编排`,
+        cal: f, time: null});
+  }
+
+  // 2) 两路 logE 分别超各自校准范围
+  for (const [logE, c, label] of [[res.logESoft, calSoft, '低反差段'],
+                                  [res.logEHard, calHard, '高反差段']]) {
+    const p = c.params;
+    let xmin, xmax;
+    if (c.range && c.range.length === 2) [xmin, xmax] = c.range;
+    else {
+      const xAt = f0 => p.x0 + Math.log10(f0 / (1 - f0)) / (LN10 * p.k);
+      xmin = xAt(0.03); xmax = xAt(0.97);
+    }
+    let nOver = 0, nUnder = 0, bOver = null, bUnder = null;
+    for (let i = 0; i < total; i++) {
+      if (logE[i] > xmax) { nOver++; bOver = addBBox(bOver, i, W, H); }
+      if (logE[i] < xmin) { nUnder++; bUnder = addBBox(bUnder, i, W, H); }
+    }
+    if (nOver / total > 0.0005)
+      warns.push({kind: 'out_of_range:over', severity: 'error',
+        message: `${label}：曝光超出响应范围：高光堵死（过曝，${(nOver/total*100).toFixed(1)}% 面积）`,
+        bbox: bOver, time: null});
+    if (nUnder / total > 0.0005)
+      warns.push({kind: 'out_of_range:under', severity: 'error',
+        message: `${label}：曝光低于响应范围：阴影无影（欠曝，${(nUnder/total*100).toFixed(1)}% 面积）`,
+        bbox: bUnder, time: null});
+  }
+
+  // 3) 目标可达性
+  const sp = plan.split || {};
+  const tg = sp.targets || {};
+  const baseRef = Math.max(+plan.base_exposure || 10, 0.01);
+  const pts = [], labels = [];
+  for (const [key, label] of [['highlight', '高光'], ['shadow', '阴影']]) {
+    const t = tg[key];
+    if (!t || t.gray === null || t.gray === undefined) continue;
+    const xi = clamp(Math.round(t.x * W), 0, W - 1);
+    const yi = clamp(Math.round(t.y * H), 0, H - 1);
+    let mS = 1, mH = 1;
+    for (const {s, f, a, b} of res.intervals) {
+      const cov = res.masks[s.region_id];
+      if (!cov) continue;
+      const tSeg = segs[f][1] - segs[f][0];
+      const d = Math.max(0, b - a) / Math.max(tSeg, 0.01) * cov[yi * W + xi];
+      if (f === 'soft') mS += s.type === 'dodge' ? -d : d;
+      else mH += s.type === 'dodge' ? -d : d;
+    }
+    const D = -Math.log10(clamp(res.grayBase[yi * W + xi], 1, 255) / 255);
+    // x_pix 由底片基础灰度反解（与 computeSplit 同一公式）
+    const ratio = clamp((D - calSoft.params.Dmin) /
+      (calSoft.params.Dmax - calSoft.params.Dmin), 1e-6, 1 - 1e-6);
+    const xPix = calSoft.params.x0 - Math.log10(1 / ratio - 1) / calSoft.params.k;
+    pts.push({x_pix: xPix, m_soft: Math.max(mS, 1e-6),
+              m_hard: Math.max(mH, 1e-6), gray: t.gray});
+    labels.push([key, label, t]);
+  }
+  if (pts.length) {
+    const sol = solveSplitTimes(calSoft.params, calHard.params,
+      calSoft.params.Dmin, pts, baseRef, sp.t_soft, sp.t_hard);
+    for (const i of sol.unreachable) {
+      const [key, label, t] = labels[i];
+      warns.push({kind: 'split_target', severity: 'error',
+        message: `${label}目标灰度 ${t.gray} 超出两条曲线的可达范围` +
+          `（${SPLIT_T_MIN}–${SPLIT_T_MAX}s 内无法达到），请调整目标或加长搜索时长`,
+        point: [t.x, t.y], which: key, time: null});
+    }
+    if (!sol.ok && !sol.unreachable.length && pts.length >= 2) {
+      const [key, , t] = labels[labels.length - 1];
+      warns.push({kind: 'split_target', severity: 'error',
+        message: '高光与阴影目标无法同时满足：两路时长搜索未收敛，请放宽其中一个目标',
+        point: [t.x, t.y], which: key, time: null});
+    }
+  }
+
+  // 4) 跨换片 / 段外步骤
+  for (const {s, f, a, b} of res.intervals) {
+    const reg = regionById(plan, s.region_id);
+    const nm = reg ? reg.name : '区域';
+    const [seg0, seg1] = segs[f];
+    const label = f === 'soft' ? '低反差' : '高反差';
+    if (a < tSwap && tSwap < b)
+      warns.push({kind: 'split_swap', severity: 'warn',
+        message: `「${nm}」的${label}滤镜曝光跨越换片节点 ${tSwap.toFixed(1)}s` +
+          `（${a.toFixed(1)}–${b.toFixed(1)}s）：换片期间该步骤无法连续执行，` +
+          `请缩短或改到另一段`,
+        steps: [s.id], time: [round2(a), round2(b)]});
+    else if (b <= seg0 || a >= seg1)
+      warns.push({kind: 'split_seg', severity: 'warn',
+        message: `「${nm}」被指定为${label}滤镜，但其时段 ${a.toFixed(1)}–` +
+          `${b.toFixed(1)}s 不在该滤镜段 ${seg0.toFixed(1)}–${seg1.toFixed(1)}s 内`,
+        steps: [s.id], time: [round2(a), round2(b)]});
+  }
+
+  // 5) 边缘跳变 / 抵消 / 双工具（与单曲线同规则，抵消按段长归一）
+  warns.push(...detectCommonSplit(res, plan));
+  return warns;
+}
+
+function detectCommonSplit(res, plan) {
+  const {gray, masks, intervals, W, H} = res;
+  const total = W * H;
+  const warns = [];
+  const scale = 1000 / Math.max(W, H);
+  const band = new Uint8Array(total);
+  for (const rid in masks) dilateBand(masks[rid], W, H, band);
+  let jumpBox = null, nJump = 0;
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x;
+      if (!band[i]) continue;
+      const gx = gray[i + 1] - gray[i - 1];
+      const gy = gray[i + W] - gray[i - W];
+      if (Math.hypot(gx, gy) * scale > EDGE_JUMP) {
+        nJump++; jumpBox = addBBox(jumpBox, i, W, H);
+      }
+    }
+  }
+  if (nJump / total > 1e-5)
+    warns.push({kind: 'edge_jump', severity: 'warn',
+      message: `工具边缘曝光跳变 ${EDGE_JUMP} 灰阶/像素以上，建议加大羽化（${nJump} 像素）`,
+      bbox: jumpBox, time: null});
+
+  const segs = {};
+  for (const [f, a, b] of res.segments) segs[f] = b - a;
+  for (let i = 0; i < intervals.length; i++) {
+    for (let j = i + 1; j < intervals.length; j++) {
+      const A = intervals[i], B = intervals[j];
+      const oa = Math.max(A.a, B.a), ob = Math.min(A.b, B.b);
+      const r1 = regionById(plan, A.s.region_id);
+      const r2 = regionById(plan, B.s.region_id);
+      if (!r1 || !r2) continue;
+      const m1 = masks[A.s.region_id], m2 = masks[B.s.region_id];
+      if (!m1 || !m2) continue;
+      let inter = 0, union = 0, area1 = 0, area2 = 0, box = null;
+      for (let k = 0; k < total; k++) {
+        const in1 = m1[k] > 0.1, in2 = m2[k] > 0.1;
+        if (in1) area1++;
+        if (in2) area2++;
+        if (in1 && in2) { inter++; box = addBBox(box, k, W, H); }
+        if (in1 || in2) union++;
+      }
+      const iou = inter / Math.max(union, 1);
+      const coverMin = inter / Math.max(area1, area2, 1);
+      if (ob - oa > 0.05 && iou > 0.02)
+        warns.push({kind: 'two_tools', severity: 'warn',
+          message: `${r1.name || '区域'} 与 ${r2.name || '区域'} 在 ${oa.toFixed(1)}–${ob.toFixed(1)}s 需同时移动两件工具`,
+          steps: [A.s.id, B.s.id], time: [round2(oa), round2(ob)]});
+      const types = new Set([A.s.type, B.s.type]);
+      if (types.has('dodge') && types.has('burn') && coverMin > CANCEL_RATIO) {
+        const d1 = (A.b - A.a) / Math.max(segs[A.f], 0.01);
+        const d2 = (B.b - B.a) / Math.max(segs[B.f], 0.01);
+        const balance = Math.min(d1, d2) / Math.max(d1, d2);
+        if (balance > 0.5)
+          warns.push({kind: 'cancel', severity: 'warn',
+            message: `${r1.name || '区域'} 的遮挡与 ${r2.name || '区域'} 的加光在同一区域互相抵消（覆盖 ${(coverMin*100)|0}%，能量差 ${(Math.abs(d1-d2)/Math.max(d1,d2)*100)|0}%），请取舍`,
+            steps: [A.s.id, B.s.id], bbox: box});
+      }
+    }
+  }
+  return warns;
+}
+
 export function intervalsOf(plan) {
   const base = Math.max(+plan.base_exposure || 10, 0.01);
   const out = [];
@@ -214,6 +608,7 @@ export function buildLUT(p) {
 }
 
 export function compute(baseGray, W, H, plan, cal, maskCache = null, time = null) {
+  if (splitEnabled(plan)) return computeSplit(baseGray, W, H, plan, cal, maskCache, time);
   const p = cal.params || defaultParams(2);
   const lut = buildLUT(p);
   const base = Math.max(+plan.base_exposure || 10, 0.01);

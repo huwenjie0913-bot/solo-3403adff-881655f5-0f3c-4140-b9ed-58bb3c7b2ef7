@@ -44,14 +44,33 @@
   <div class="meta">
     <div><b>放大倍率</b><span class="big">{{ p.magnification }}×</span></div>
     <div><b>光圈</b><span class="big">{{ p.aperture }}</span></div>
+    {% if is_split %}
+    <div><b>曝光模式</b><span class="big">分级滤镜</span></div>
+    <div><b>低反差段（#00）</b><span class="big">{{ '%.1f'|format(split_info.t_soft) }} s</span></div>
+    <div><b>高反差段（#5）</b><span class="big">{{ '%.1f'|format(split_info.t_hard) }} s</span></div>
+    <div><b>换片时刻</b><span class="big">{{ '%.1f'|format(split_info.swap_t) }} s</span></div>
+    {% else %}
     <div><b>基础曝光</b><span class="big">{{ p.base_exposure }} s</span></div>
     <div><b>相纸反差号</b><span class="big">{{ p.paper_grade }} 号</span></div>
+    {% endif %}
     <div><b>底片尺寸</b>{{ p.image_w }}×{{ p.image_h }} px 扫描</div>
     <div><b>极性</b>{{ '正像/反相' if p.negative_invert else '底片扫描' }}</div>
+    {% if not is_split %}
     <div><b>曲线校准</b>{{ '已校准（RMS %.2f）'|format(cal.rms) if cal.calibrated else '未校准（默认曲线）' }}</div>
+    {% endif %}
     <div><b>总耗时</b><span class="big">{{ '%.1f'|format(total) }} s</span></div>
   </div>
-  {% if cal.calibrated and cal.range %}
+  {% if is_split %}
+  <p style="margin:6px 0">滤镜顺序：<b>先低反差滤镜（#00）{{ '%.1f'|format(split_info.t_soft) }}s
+    → 换片 → 后高反差滤镜（#5）{{ '%.1f'|format(split_info.t_hard) }}s</b>；
+    换片动作在 {{ '%.1f'|format(split_info.swap_t) }}s 处（见秒表节点）。</p>
+  {% for fc, fname in [(cal.split.soft, '低反差'), (cal.split.hard, '高反差')] %}
+  <p style="margin:2px 0">{{ fname }}滤镜曲线：
+    {% if fc.calibrated %}已校准（RMS {{ '%.2f'|format(fc.rms) }}）{% else %}未校准（默认 {{ 0 if fname=='低反差' else 5 }} 号曲线）{% endif %}
+    Dmin={{ '%.2f'|format(fc.params.Dmin) }} Dmax={{ '%.2f'|format(fc.params.Dmax) }}
+    x0={{ '%.2f'|format(fc.params.x0) }} k={{ '%.2f'|format(fc.params.k) }}</p>
+  {% endfor %}
+  {% elif cal.calibrated and cal.range %}
   <p style="margin:6px 0">实测响应区间：<b>{{ '%.1f'|format(p.base_exposure * 10**cal.range[0]) }}s
     – {{ '%.1f'|format(p.base_exposure * 10**cal.range[1]) }}s</b>
     （相对基础曝光）；曲线参数 Dmin={{ '%.2f'|format(cal.params.Dmin) }}
@@ -69,13 +88,14 @@
 
   <h2>三、分段步骤</h2>
   <table>
-    <thead><tr><th>#</th><th>类型</th><th>区域</th><th>开始(s)</th><th>持续(s)</th><th>结束(s)</th>
+    <thead><tr><th>#</th><th>类型</th>{% if is_split %}<th>滤镜</th>{% endif %}<th>区域</th><th>开始(s)</th><th>持续(s)</th><th>结束(s)</th>
       <th>参数</th><th>工具直径/羽化</th></tr></thead>
     <tbody>
     {% for r in rows %}
       <tr>
         <td>{{ r.n }}</td>
         <td><span class="swatch" style="background:{{ '#ff8c1a' if r.type=='加光' else '#50aaff' }}"></span>{{ r.type }}</td>
+        {% if is_split %}<td>{{ r.filter }}</td>{% endif %}
         <td>{{ r.region }}</td>
         <td>{{ '%.1f'|format(r.start) }}</td>
         <td><b>{{ '%.1f'|format(r.dur) }}</b></td>
@@ -85,7 +105,7 @@
             {% else %}多边形 / {{ '%.0f'|format(r.feather or 0) }}px 羽化{% endif %}</td>
       </tr>
     {% else %}
-      <tr><td colspan="8">无局部步骤（纯基础曝光）。</td></tr>
+      <tr><td colspan="{{ 9 if is_split else 8 }}">无局部步骤（纯基础曝光）。</td></tr>
     {% endfor %}
     </tbody>
   </table>

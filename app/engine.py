@@ -143,6 +143,70 @@ def normalize_calibration(cal, grade=2, base_exposure=10.0):
     return out
 
 
+# ---------------------------------------------------------------- split-grade
+
+# 分级滤镜（split-grade）：同一张相纸分两段曝光——先低反差滤镜（软，约 00 号）
+# 后高反差滤镜（硬，约 5 号）。每段按各自拟合曲线产生"净密度贡献"
+# （超出纸基 Dmin 的密度），总密度 = 纸基 + 两段净贡献之和。
+SPLIT_GRADES = {"soft": 0, "hard": 5}      # 未校准时的默认反差号
+SPLIT_T_MIN, SPLIT_T_MAX = 0.2, 600.0      # 目标求解的时长搜索界限(s)
+
+
+def split_enabled(plan):
+    sp = (plan or {}).get("split") or {}
+    return bool(sp.get("enabled"))
+
+
+def normalize_split(cal):
+    """取出 calibration.split 的两条曲线并补默认参数。"""
+    sc = (cal or {}).get("split") or {}
+    return (normalize_calibration(sc.get("soft"), SPLIT_GRADES["soft"]),
+            normalize_calibration(sc.get("hard"), SPLIT_GRADES["hard"]))
+
+
+def step_filter(s):
+    """步骤所属滤镜段。缺省按暗房习惯：遮挡护高光→软段，加光塑阴影→硬段。"""
+    f = s.get("filter")
+    if f in ("soft", "hard"):
+        return f
+    return "soft" if s.get("type") == "dodge" else "hard"
+
+
+def split_times(plan):
+    sp = (plan or {}).get("split") or {}
+    t_soft = min(600.0, max(0.05, float(sp.get("t_soft", 10.0) or 10.0)))
+    t_hard = min(600.0, max(0.05, float(sp.get("t_hard", 10.0) or 10.0)))
+    return t_soft, t_hard
+
+
+def split_segments(plan):
+    """两个连续曝光段：(滤镜, 段首, 段尾)。换片节点 = 软段结束。"""
+    t_soft, t_hard = split_times(plan)
+    return [("soft", 0.0, t_soft), ("hard", t_soft, t_soft + t_hard)]
+
+
+def split_intervals(plan):
+    """展开 split 模式步骤区间为 (step, filter, a, b)。
+    每段相当于一次独立基础曝光：遮挡时长 = ratio×段长，
+    加光追加 = 段长×(2^stops − 1)。步骤被约束在各自滤镜段内
+    （加光允许越过段尾——软段越界即跨越换片，由检测提示）。"""
+    segs = dict((f, (a, b)) for f, a, b in split_segments(plan))
+    out = []
+    for s in _steps(plan):
+        f = step_filter(s)
+        seg0, seg1 = segs[f]
+        t_seg = max(seg1 - seg0, 0.01)
+        if s.get("type") == "dodge":
+            dur = t_seg * min(1.0, max(0.0, float(s.get("ratio", 0))))
+            a = min(max(float(s.get("start", seg0)), seg0), seg0 + t_seg - dur)
+            out.append((s, f, a, a + dur))
+        elif s.get("type") == "burn":
+            dur = t_seg * (2.0 ** float(s.get("stops", 0)) - 1.0)
+            a = max(float(s.get("start", seg1)), seg0)
+            out.append((s, f, a, a + dur))
+    return out
+
+
 # ---------------------------------------------------------------- LUT
 
 def build_lut(params):
@@ -208,7 +272,10 @@ def compute(base_gray, plan, cal, ref_size=1000):
     """累计曝光计算。
     base_gray: HxW float32，基础曝光下的灰度（由底片扫描的透光率映射）。
     返回 dict: gray, logE, masks{id}, base_map, out_hi/out_lo, contours, warnings。
+    plan.split.enabled 时走分级滤镜双段合成（见 compute_split）。
     """
+    if split_enabled(plan):
+        return compute_split(base_gray, plan, cal, ref_size)
     H, W = base_gray.shape
     params = cal["params"]
     lut = build_lut(params)
@@ -278,6 +345,102 @@ def _find_region(plan, rid):
         if r.get("id") == rid:
             return r
     return None
+
+
+# ---------------------------------------------------------------- split 合成
+
+def _invert_x(base_gray, params):
+    """由基础灰度反解每像素相对 log 曝光量（以 plan.base_exposure 为参考）。
+    注意：单曲线模式沿用历史公式（除以 ln10·k，见 compute），旧方案行为不变；
+    split 模式是新模型，这里使用 logistic 的精确反解（除以 k），
+    使"软段单独曝光 base_ref 秒"恰好复现 base_gray。"""
+    Dbase = -np.log10(np.clip(base_gray, 1.0, 255.0) / 255.0)
+    ratio = np.clip((Dbase - params["Dmin"]) /
+                    (params["Dmax"] - params["Dmin"]), 1e-6, 1 - 1e-6)
+    return params["x0"] - np.log10(1.0 / ratio - 1.0) / params["k"]
+
+
+def _net_density(logE, params):
+    """净密度贡献：logistic(logE) − Dmin（直接求值，尾部不做 LUT 截断，
+    高光透光区的 logE 可低至 −10 以下，LUT 截断会引入显著密度误差）。"""
+    Dmin, Dmax, x0, k = (params["Dmin"], params["Dmax"],
+                         params["x0"], params["k"])
+    z = np.power(10.0, np.clip(-k * (logE - x0), -300, 300))
+    return (Dmax - Dmin) / (1.0 + z)
+
+
+def compute_split(base_gray, plan, cal, ref_size=1000):
+    """分级滤镜双段合成。
+    每像素：logE_soft/logE_hard 为两段各自的 log 曝光量（含局部步骤），
+    总密度 = Dmin_ref + 净贡献_soft + 净贡献_hard，再换算灰度。
+    同时输出 gray_soft/gray_hard 两个单段视图与换片时刻 swap_t。
+    """
+    H, W = base_gray.shape
+    cal_soft, cal_hard = normalize_split(cal)
+    ps, ph = cal_soft["params"], cal_hard["params"]
+    dmin_ref = ps["Dmin"]
+    t_soft, t_hard = split_times(plan)
+    base_ref = max(float(plan.get("base_exposure", 10.0)), 0.01)
+
+    # 底片透光率参数化：用软滤镜曲线反解（软段单独曝光 base_ref 秒时
+    # 净密度恰为 base_gray 对应密度 − Dmin，保持与单曲线模式一致）
+    x_pix = _invert_x(base_gray, ps).astype(np.float64)
+
+    # 两路曝光能量（段基础曝光为 1，步骤按段长归一增减）
+    mult_s = np.ones((H, W), dtype=np.float64)
+    mult_h = np.ones((H, W), dtype=np.float64)
+    masks = {}
+    scale = ref_size / max(H, W)
+    intervals = split_intervals(plan)
+    for s, f, a, b in intervals:
+        rid = s.get("region_id")
+        region = _find_region(plan, rid)
+        if region is None:
+            continue
+        if rid not in masks:
+            masks[rid] = rasterize_region(region, W, H)
+        cov = masks[rid]
+        t_seg = t_soft if f == "soft" else t_hard
+        d = max(0.0, (b - a) / t_seg)
+        tgt = mult_s if f == "soft" else mult_h
+        if s["type"] == "dodge":
+            tgt -= d * cov
+        else:
+            tgt += d * cov
+
+    logE_s = x_pix + np.log10(np.maximum(t_soft * mult_s, 1e-6) / base_ref)
+    logE_h = x_pix + np.log10(np.maximum(t_hard * mult_h, 1e-6) / base_ref)
+    net_s = _net_density(logE_s, ps)
+    net_h = _net_density(logE_h, ph)
+
+    def to_gray(dens):
+        return np.clip(255.0 * np.power(10.0, -dens), 0, 255).astype(np.float32)
+
+    gray = to_gray(dmin_ref + net_s + net_h)
+    gray_soft = to_gray(dmin_ref + net_s)
+    gray_hard = to_gray(dmin_ref + net_h)
+
+    result = {
+        "gray": gray,
+        "gray_soft": gray_soft,
+        "gray_hard": gray_hard,
+        "logE": np.minimum(logE_s, logE_h).astype(np.float32),
+        "logE_soft": logE_s.astype(np.float32),
+        "logE_hard": logE_h.astype(np.float32),
+        "masks": masks,
+        "base_map": base_gray.astype(np.float32),
+        "intervals": [(s.get("id"), s.get("type"), round(a, 3), round(b, 3), f)
+                      for s, f, a, b in intervals],
+        "segments": [(f, round(a, 3), round(b, 3))
+                     for f, a, b in split_segments(plan)],
+        "swap_t": t_soft,
+        "timeline_end": max([t_soft + t_hard] + [b for _, _, _, b in intervals]),
+        "warnings": [],
+    }
+    result["warnings"] = detect_warnings_split(
+        result, plan, cal, cal_soft, cal_hard, scale, intervals)
+    result["contours"] = contours(gray, scale)
+    return result
 
 
 # ---------------------------------------------------------------- warnings
@@ -409,6 +572,351 @@ def _bbox_of(mask):
         return None
     return [float(xs.min()) / W, float(ys.min()) / H,
             float(xs.max()) / W, float(ys.max()) / H]
+
+
+# ---------------------------------------------------------------- split 求解
+
+def _logistic_scalar(x, p):
+    return p["Dmin"] + (p["Dmax"] - p["Dmin"]) / \
+        (1.0 + 10.0 ** (-p["k"] * (x - p["x0"])))
+
+
+def _logistic_deriv(x, p):
+    """dD/dx，x 为 log10 相对曝光量。"""
+    z = 10.0 ** (-p["k"] * (x - p["x0"]))
+    sig = 1.0 / (1.0 + z)
+    return (p["Dmax"] - p["Dmin"]) * math.log(10) * p["k"] * sig * (1 - sig)
+
+
+def split_target_density(gray_target, dmin_ref):
+    """目标灰度 → 需要两段共同提供的净密度。"""
+    g = min(255.0, max(1.0, float(gray_target)))
+    return math.log10(255.0 / g) - dmin_ref
+
+
+def solve_split_exposures(ps, ph, dmin_ref, targets, base_ref,
+                          t_lo=SPLIT_T_MIN, t_hi=SPLIT_T_MAX,
+                          t_soft0=None, t_hard0=None):
+    """搜索两路基础曝光时长，使各目标点达到目标灰度。
+    targets: [{x_pix, m_soft, m_hard, gray}]，每点一个方程：
+        net_soft(x + log10(m_s·t_s/B)) + net_hard(x + log10(m_h·t_h/B))
+            = D(gray) − Dmin_ref
+    两点时用阻尼牛顿解 2×2 系统；单点时退化为单变量二分
+    （另一路时长保持初值）。返回 {t_soft, t_hard, ok, residual,
+    unreachable:[...]}。unreachable 列出超出可达范围的目标下标。
+    """
+    pts = []
+    for t in targets:
+        if t is None:
+            continue
+        pts.append({
+            "a_s": float(t["x_pix"]) +
+                   math.log10(max(float(t.get("m_soft", 1.0)), 1e-6) / base_ref),
+            "a_h": float(t["x_pix"]) +
+                   math.log10(max(float(t.get("m_hard", 1.0)), 1e-6) / base_ref),
+            "dt": split_target_density(t.get("gray", 128), dmin_ref),
+        })
+    if not pts:
+        return {"t_soft": t_soft0, "t_hard": t_hard0, "ok": False,
+                "residual": None, "unreachable": []}
+
+    # 可达范围：净密度 ∈ [0, 两路最大净贡献之和]（时长界限内）
+    lo_u, hi_u = math.log10(t_lo), math.log10(t_hi)
+    unreachable = []
+    for i, q in enumerate(pts):
+        net_max = (_logistic_scalar(q["a_s"] + hi_u, ps) - ps["Dmin"] +
+                   _logistic_scalar(q["a_h"] + hi_u, ph) - ph["Dmin"])
+        net_min = (_logistic_scalar(q["a_s"] + lo_u, ps) - ps["Dmin"] +
+                   _logistic_scalar(q["a_h"] + lo_u, ph) - ph["Dmin"])
+        if q["dt"] < net_min - 1e-9 or q["dt"] > net_max + 1e-9:
+            unreachable.append(i)
+
+    def resid(u, v):
+        return [(_logistic_scalar(q["a_s"] + u, ps) - ps["Dmin"] +
+                 _logistic_scalar(q["a_h"] + v, ph) - ph["Dmin"]) - q["dt"]
+                for q in pts]
+
+    u = math.log10(min(max(t_soft0 or 10.0, t_lo), t_hi))
+    v = math.log10(min(max(t_hard0 or 10.0, t_lo), t_hi))
+    ok = False
+    r = resid(u, v)
+    if len(pts) == 1:
+        # 单目标：只调软路（高光主要由低反差段控制），硬路保持
+        for _ in range(80):
+            r = resid(u, v)[0]
+            if abs(r) < 1e-5:
+                ok = True
+                break
+            d = _logistic_deriv(pts[0]["a_s"] + u, ps)
+            if d < 1e-9:
+                break
+            u = min(hi_u, max(lo_u, u - r / d))
+        r = resid(u, v)
+    else:
+        for _ in range(80):
+            r = resid(u, v)
+            if max(abs(r[0]), abs(r[1])) < 1e-5:
+                ok = True
+                break
+            j11 = _logistic_deriv(pts[0]["a_s"] + u, ps)
+            j12 = _logistic_deriv(pts[0]["a_h"] + v, ph)
+            j21 = _logistic_deriv(pts[1]["a_s"] + u, ps)
+            j22 = _logistic_deriv(pts[1]["a_h"] + v, ph)
+            det = j11 * j22 - j12 * j21
+            if abs(det) < 1e-12:
+                break
+            du = (r[0] * j22 - r[1] * j12) / det
+            dv = (j11 * r[1] - j21 * r[0]) / det
+            # 阻尼：单步不超过 0.5 个数量级，越界则收缩
+            for damp in (1.0, 0.5, 0.25, 0.1):
+                nu = min(hi_u, max(lo_u, u - damp * du))
+                nv = min(hi_u, max(lo_u, v - damp * dv))
+                nr = resid(nu, nv)
+                if max(abs(nr[0]), abs(nr[1])) < max(abs(r[0]), abs(r[1])):
+                    u, v = nu, nv
+                    break
+            else:
+                break
+        r = resid(u, v)
+        ok = max(abs(r[0]), abs(r[1])) < 1e-3
+
+    return {"t_soft": round(10.0 ** u, 2), "t_hard": round(10.0 ** v, 2),
+            "ok": ok and not unreachable,
+            "residual": max(abs(x) for x in r),
+            "unreachable": unreachable}
+
+
+# ---------------------------------------------------------------- split 检测
+
+def detect_warnings_split(result, plan, cal, cal_soft, cal_hard, scale,
+                          intervals):
+    """split 模式问题检测：沿用单曲线的范围/边缘/抵消/双工具检查
+    （对两路 logE 分别判范围），另加：
+      split_cal    校准点不足（n<2）
+      split_target 目标灰度超出两条曲线的可达范围
+      split_swap   局部曝光跨越换片节点
+      split_seg    步骤落在其滤镜段之外
+    """
+    warns = []
+    H, W = result["gray"].shape
+    total = H * W
+    t_swap = result["swap_t"]
+    segs = dict((f, (a, b)) for f, a, b in result["segments"])
+
+    # 1) 校准点不足 → 定位到校准面板
+    for f, c, label in (("soft", cal_soft, "低反差"), ("hard", cal_hard, "高反差")):
+        n = int(c.get("n") or len(c.get("points") or []))
+        if n < 2:
+            warns.append({
+                "kind": "split_cal", "severity": "error",
+                "message": f"{label}滤镜校准点不足（{n}/2）："
+                           f"请录入阶梯曝光并拟合后再编排",
+                "cal": f, "time": None,
+            })
+
+    # 2) 两路 logE 超各自校准范围
+    for logE, c, label, tag in (
+            (result["logE_soft"], cal_soft, "低反差段", "soft"),
+            (result["logE_hard"], cal_hard, "高反差段", "hard")):
+        cr = c.get("range")
+        p = c["params"]
+        if cr:
+            xmin, xmax = float(cr[0]), float(cr[1])
+        else:
+            L = math.log(10)
+            xmin = p["x0"] + math.log10(0.03 / 0.97) / (L * p["k"])
+            xmax = p["x0"] + math.log10(0.97 / 0.03) / (L * p["k"])
+        for mask, kind, msg in (
+                (logE > xmax, "over", "曝光超出响应范围：高光堵死（过曝）"),
+                (logE < xmin, "under", "曝光低于响应范围：阴影无影（欠曝）")):
+            n = int(mask.sum())
+            if n / total > 0.0005:
+                ys, xs = np.where(mask)
+                warns.append({
+                    "kind": f"out_of_range:{kind}", "severity": "error",
+                    "message": f"{label}：{msg}（{n/total*100:.1f}% 面积）",
+                    "bbox": [float(xs.min()) / W, float(ys.min()) / H,
+                             float(xs.max()) / W, float(ys.max()) / H],
+                    "time": None,
+                })
+
+    # 3) 目标可达性（高光/阴影目标点）
+    sp = plan.get("split") or {}
+    tg = sp.get("targets") or {}
+    base_ref = max(float(plan.get("base_exposure", 10.0)), 0.01)
+    ps, ph = cal_soft["params"], cal_hard["params"]
+    pts, labels = [], []
+    for key, label in (("highlight", "高光"), ("shadow", "阴影")):
+        t = tg.get(key)
+        if t and t.get("gray") is not None:
+            xi = min(W - 1, max(0, int(round(float(t["x"]) * W))))
+            yi = min(H - 1, max(0, int(round(float(t["y"]) * H))))
+            # 目标点处的两路能量系数（由当前步骤布局决定）
+            m_s = m_h = 1.0
+            for s, f, a, b in intervals:
+                cov = result["masks"].get(s.get("region_id"))
+                if cov is None:
+                    continue
+                t_seg = segs[f][1] - segs[f][0]
+                d = max(0.0, (b - a) / max(t_seg, 0.01)) * float(cov[yi, xi])
+                if f == "soft":
+                    m_s += -d if s["type"] == "dodge" else d
+                else:
+                    m_h += -d if s["type"] == "dodge" else d
+            x_pix = float(_invert_x(
+                result["base_map"][yi:yi + 1, xi:xi + 1], ps)[0, 0])
+            pts.append({"x_pix": x_pix, "m_soft": max(m_s, 1e-6),
+                        "m_hard": max(m_h, 1e-6), "gray": t["gray"]})
+            labels.append((key, label, t))
+    if pts:
+        sol = solve_split_exposures(
+            ps, ph, ps["Dmin"], pts, base_ref,
+            t_soft0=sp.get("t_soft"), t_hard0=sp.get("t_hard"))
+        for i in sol["unreachable"]:
+            key, label, t = labels[i]
+            warns.append({
+                "kind": "split_target", "severity": "error",
+                "message": f"{label}目标灰度 {t['gray']} 超出两条曲线的可达范围"
+                           f"（{SPLIT_T_MIN:g}–{SPLIT_T_MAX:g}s 内无法达到），"
+                           f"请调整目标或加长搜索时长",
+                "point": [float(t["x"]), float(t["y"])], "which": key,
+                "time": None,
+            })
+        if not sol["ok"] and not sol["unreachable"] and len(pts) >= 2:
+            # 各自可达但联立无解（两目标相互牵制）
+            key, label, t = labels[-1]
+            warns.append({
+                "kind": "split_target", "severity": "error",
+                "message": "高光与阴影目标无法同时满足：两路时长搜索未收敛，"
+                           "请放宽其中一个目标",
+                "point": [float(t["x"]), float(t["y"])], "which": key,
+                "time": None,
+            })
+
+    # 4) 跨换片 & 段外步骤
+    regions = {r["id"]: r for r in plan.get("regions", [])}
+    for s, f, a, b in intervals:
+        reg = regions.get(s.get("region_id"), {})
+        nm = reg.get("name", "区域")
+        seg0, seg1 = segs[f]
+        label = "低反差" if f == "soft" else "高反差"
+        if a < t_swap < b:
+            warns.append({
+                "kind": "split_swap", "severity": "warn",
+                "message": f"「{nm}」的{label}滤镜曝光跨越换片节点 "
+                           f"{t_swap:.1f}s（{a:.1f}–{b:.1f}s）：换片期间该步骤"
+                           f"无法连续执行，请缩短或改到另一段",
+                "steps": [s.get("id")],
+                "time": [round(a, 2), round(b, 2)],
+            })
+        elif b <= seg0 or a >= seg1:
+            warns.append({
+                "kind": "split_seg", "severity": "warn",
+                "message": f"「{nm}」被指定为{label}滤镜，但其时段 "
+                           f"{a:.1f}–{b:.1f}s 不在该滤镜段 "
+                           f"{seg0:.1f}–{seg1:.1f}s 内",
+                "steps": [s.get("id")],
+                "time": [round(a, 2), round(b, 2)],
+            })
+
+    # 5) 边缘跳变 / 抵消 / 双工具：复用单曲线检测（基于合成灰度）
+    pseudo = dict(result)
+    pseudo["logE"] = result["logE"]
+    t_soft, t_hard = split_times(plan)
+    warns.extend(_detect_common(
+        pseudo, plan, scale, intervals,
+        seg_lens={"soft": t_soft, "hard": t_hard}))
+    return warns
+
+
+def _detect_common(result, plan, scale, intervals, seg_lens=None):
+    """边缘跳变、互相抵消、双工具三类与模式无关的检测。
+    intervals 为 (step, filter, a, b)；seg_lens 给出各滤镜段长，
+    用于把步骤时长归一为基础曝光能量比例。"""
+    gray = result["gray"]
+    masks = result["masks"]
+    H, W = gray.shape
+    total = H * W
+    warns = []
+    seg_lens = seg_lens or {}
+
+    gx = np.zeros_like(gray)
+    gy = np.zeros_like(gray)
+    gx[:, 1:-1] = gray[:, 2:] - gray[:, :-2]
+    gy[1:-1, :] = gray[2:, :] - gray[:-2, :]
+    gmag = np.hypot(gx, gy) * scale
+    band = np.zeros((H, W), dtype=bool)
+    for cov in masks.values():
+        edge = cov > 0.03
+        if edge.any():
+            from PIL import Image, ImageFilter
+            k = EDGELEN * 2 + 1
+            dil = np.asarray(
+                Image.fromarray((edge * 255).astype(np.uint8))
+                     .filter(ImageFilter.MaxFilter(k))
+            ) > 0
+            band |= dil
+    jump = (gmag > EDGE_JUMP_LEVELS) & band
+    n = int(jump.sum())
+    if n / total > 1e-5:
+        ys, xs = np.where(jump)
+        warns.append({
+            "kind": "edge_jump",
+            "severity": "warn",
+            "message": f"工具边缘曝光跳变 {EDGE_JUMP_LEVELS:.0f} 灰阶/像素以上，"
+                       f"建议加大羽化（{n} 像素）",
+            "bbox": [float(xs.min()) / W, float(ys.min()) / H,
+                     float(xs.max()) / W, float(ys.max()) / H],
+            "time": None,
+        })
+
+    for i in range(len(intervals)):
+        s1, a1, b1 = intervals[i][0], intervals[i][2], intervals[i][3]
+        for j in range(i + 1, len(intervals)):
+            s2, a2, b2 = intervals[j][0], intervals[j][2], intervals[j][3]
+            ov_a, ov_b = max(a1, a2), min(b1, b2)
+            r1 = _find_region(plan, s1.get("region_id"))
+            r2 = _find_region(plan, s2.get("region_id"))
+            if r1 is None or r2 is None:
+                continue
+            m1 = masks.get(s1["region_id"])
+            m2 = masks.get(s2["region_id"])
+            if m1 is None or m2 is None:
+                continue
+            inter = (m1 > 0.1) & (m2 > 0.1)
+            union = (m1 > 0.1) | (m2 > 0.1)
+            iou = float(inter.sum()) / max(int(union.sum()), 1)
+            cover_min = float(inter.sum()) / max(
+                int((m1 > 0.1).sum()), int((m2 > 0.1).sum()), 1)
+            if ov_b - ov_a > 0.05 and iou > 0.02:
+                warns.append({
+                    "kind": "two_tools",
+                    "severity": "warn",
+                    "message": f"{r1.get('name','区域')} 与 {r2.get('name','区域')} "
+                               f"在 {ov_a:.1f}–{ov_b:.1f}s 需同时移动两件工具",
+                    "steps": [s1.get("id"), s2.get("id")],
+                    "time": [round(ov_a, 2), round(ov_b, 2)],
+                })
+            if {s1["type"], s2["type"]} == {"dodge", "burn"} and \
+                    cover_min > CANCEL_RATIO:
+                f1, f2 = intervals[i][1], intervals[j][1]
+                d1 = (b1 - a1) / max(seg_lens.get(f1, 1.0), 0.01)
+                d2 = (b2 - a2) / max(seg_lens.get(f2, 1.0), 0.01)
+                balance = min(d1, d2) / max(d1, d2)
+                if balance > 0.5:
+                    warns.append({
+                        "kind": "cancel",
+                        "severity": "warn",
+                        "message": f"{r1.get('name','区域')} 的遮挡与 "
+                                   f"{r2.get('name','区域')} 的加光在同一区域"
+                                   f"互相抵消（覆盖 {cover_min*100:.0f}%，"
+                                   f"能量差 {abs(d1-d2)/max(d1,d2)*100:.0f}%），"
+                                   f"请取舍",
+                        "steps": [s1.get("id"), s2.get("id")],
+                        "bbox": _bbox_of(inter),
+                        "time": None,
+                    })
+    return warns
 
 
 # ---------------------------------------------------------------- contours
