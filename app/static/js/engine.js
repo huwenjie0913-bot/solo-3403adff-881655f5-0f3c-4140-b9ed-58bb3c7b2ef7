@@ -220,31 +220,50 @@ export function splitTimes(plan) {
   return [t(sp.t_soft), t(sp.t_hard)];
 }
 
+// 分级滤镜时间轴布局：软段从 0 开始、基础 t_soft，段尾延伸至最迟的
+// 软步骤（加光追加会延长该滤镜的连续曝光时段）；换片节点 = 软段结束；
+// 硬段从换片点开始，同样为基础 t_hard 加步骤延伸。遮挡钳在所属段的
+// 基础窗口内、加光钳到段首之后，因此每个步骤始终落在所属滤镜的
+// 连续曝光段内。
+export function splitLayout(plan) {
+  const [tSoft, tHard] = splitTimes(plan);
+  const steps = plan.steps || [];
+  const mk = (s, f, seg0, tBase) => {
+    if (s.type === 'dodge') {
+      const dur = tBase * clamp(+s.ratio || 0, 0, 1);
+      const a = Math.min(Math.max(+s.start || 0, seg0), seg0 + tBase - dur);
+      return {s, f, a, b: a + dur};
+    }
+    const dur = tBase * (2 ** (+s.stops || 0) - 1);
+    const a = Math.max(s.start === null || s.start === undefined
+                       ? seg0 + tBase : +s.start, seg0);
+    return {s, f, a, b: a + dur};
+  };
+  const intervals = [];
+  let softEnd = tSoft;
+  for (const s of steps) {
+    if (stepFilter(s) !== 'soft') continue;
+    const iv = mk(s, 'soft', 0, tSoft);
+    intervals.push(iv);
+    softEnd = Math.max(softEnd, iv.b);
+  }
+  let hardEnd = softEnd + tHard;
+  for (const s of steps) {
+    if (stepFilter(s) !== 'hard') continue;
+    const iv = mk(s, 'hard', softEnd, tHard);
+    intervals.push(iv);
+    hardEnd = Math.max(hardEnd, iv.b);
+  }
+  return {segments: [['soft', 0, softEnd], ['hard', softEnd, hardEnd]],
+          intervals, swapT: softEnd, tSoft, tHard};
+}
+
 export function splitSegments(plan) {
-  const [ts, th] = splitTimes(plan);
-  return [['soft', 0, ts], ['hard', ts, ts + th]];
+  return splitLayout(plan).segments;
 }
 
 export function splitIntervals(plan) {
-  const segs = {};
-  for (const [f, a, b] of splitSegments(plan)) segs[f] = [a, b];
-  const out = [];
-  for (const s of plan.steps || []) {
-    const f = stepFilter(s);
-    const [seg0, seg1] = segs[f];
-    const tSeg = Math.max(seg1 - seg0, 0.01);
-    if (s.type === 'dodge') {
-      const dur = tSeg * clamp(+s.ratio || 0, 0, 1);
-      const a = Math.min(Math.max(+s.start || 0, seg0), seg0 + tSeg - dur);
-      out.push({s, f, a, b: a + dur});
-    } else {
-      const dur = tSeg * (2 ** (+s.stops || 0) - 1);
-      const a = Math.max(s.start === null || s.start === undefined ? seg1
-                         : +s.start, seg0);
-      out.push({s, f, a, b: a + dur});
-    }
-  }
-  return out;
+  return splitLayout(plan).intervals;
 }
 
 // logistic 精确反解（split 新模型；单曲线旧公式保持不动）
@@ -275,18 +294,19 @@ export function computeSplit(baseGray, W, H, plan, cal, maskCache, time) {
   const [calSoft, calHard] = normalizeSplit(cal);
   const ps = calSoft.params, ph = calHard.params;
   const dminRef = ps.Dmin;
-  const [tSoft, tHard] = splitTimes(plan);
+  const layout = splitLayout(plan);
+  const tSoft = layout.tSoft, tHard = layout.tHard, swapT = layout.swapT;
   const baseRef = Math.max(+plan.base_exposure || 10, 0.01);
   const xPix = invertX(baseGray, W, H, ps);
 
-  const intervals = splitIntervals(plan);
+  const intervals = layout.intervals;
   const masks = {};
   const scrub = time !== null && time !== undefined;
-  // 两路曝光能量（段基础曝光为 1；擦洗时按已流逝比例）
+  // 两路曝光能量（段基础曝光为 1；擦洗时按已流逝比例，硬段从换片点起算）
   const multS = new Float64Array(W * H);
   const multH = new Float64Array(W * H);
   multS.fill(scrub ? clamp(time, 0, tSoft) / tSoft : 1);
-  multH.fill(scrub ? clamp(time - tSoft, 0, tHard) / tHard : 1);
+  multH.fill(scrub ? clamp(time - swapT, 0, tHard) / tHard : 1);
 
   for (const {s, f, a, b} of intervals) {
     const rid = s.region_id;
@@ -329,14 +349,14 @@ export function computeSplit(baseGray, W, H, plan, cal, maskCache, time) {
     grayS[i] = clamp(255 * 10 ** -(dminRef + ns), 0, 255);
     grayH[i] = clamp(255 * 10 ** -(dminRef + nh), 0, 255);
   }
-  const end = Math.max(tSoft + tHard, ...intervals.map(v => v.b));
+  const end = layout.segments[1][2];
   const logE = new Float32Array(N);
   for (let i = 0; i < N; i++) logE[i] = Math.min(logEs[i], logEh[i]);
 
   const res = {gray, graySoft: grayS, grayHard: grayH, logE,
                logESoft: logEs, logEHard: logEh, grayBase: baseGray,
-               masks, intervals, segments: splitSegments(plan),
-               swapT: tSoft, timelineEnd: end, warnings: [], contours: [], W, H};
+               masks, intervals, segments: layout.segments,
+               swapT, timelineEnd: end, warnings: [], contours: [], W, H};
   res.warnings = scrub ? [] : detectSplit(res, plan, cal, calSoft, calHard);
   res.contours = extractContours(gray, W, H);
   return res;
@@ -452,6 +472,7 @@ function detectSplit(res, plan, cal, calSoft, calHard) {
   const sp = plan.split || {};
   const tg = sp.targets || {};
   const baseRef = Math.max(+plan.base_exposure || 10, 0.01);
+  const [tSoftB, tHardB] = splitTimes(plan);   // 段基础时长（能量归一基准）
   const pts = [], labels = [];
   for (const [key, label] of [['highlight', '高光'], ['shadow', '阴影']]) {
     const t = tg[key];
@@ -462,7 +483,8 @@ function detectSplit(res, plan, cal, calSoft, calHard) {
     for (const {s, f, a, b} of res.intervals) {
       const cov = res.masks[s.region_id];
       if (!cov) continue;
-      const tSeg = segs[f][1] - segs[f][0];
+      // 与 computeSplit 一致：按段基础时长归一
+      const tSeg = f === 'soft' ? tSoftB : tHardB;
       const d = Math.max(0, b - a) / Math.max(tSeg, 0.01) * cov[yi * W + xi];
       if (f === 'soft') mS += s.type === 'dodge' ? -d : d;
       else mH += s.type === 'dodge' ? -d : d;
@@ -542,8 +564,9 @@ function detectCommonSplit(res, plan) {
       message: `工具边缘曝光跳变 ${EDGE_JUMP} 灰阶/像素以上，建议加大羽化（${nJump} 像素）`,
       bbox: jumpBox, time: null});
 
-  const segs = {};
-  for (const [f, a, b] of res.segments) segs[f] = b - a;
+  // 抵消判定按段基础时长归一（与 computeSplit 的能量口径一致）
+  const [tSoftC, tHardC] = splitTimes(plan);
+  const segs = {soft: tSoftC, hard: tHardC};
   for (let i = 0; i < intervals.length; i++) {
     for (let j = i + 1; j < intervals.length; j++) {
       const A = intervals[i], B = intervals[j];

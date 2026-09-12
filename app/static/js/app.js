@@ -516,6 +516,7 @@ export class App {
   }
 
   clampSteps() {
+    if (this.splitMode()) { this.clampStepsSplit(); return; }
     const base = this.plan.base_exposure;
     for (const s of this.plan.steps) {
       if (s.type === 'dodge') {
@@ -525,12 +526,52 @@ export class App {
     }
   }
 
+  // 分级滤镜：splitIntervals 内部已把遮挡钳进所属段的基础窗口、
+  // 加光钳到段首之后；把钳制后的开始时刻写回 plan，
+  // 使每个步骤始终落在所属滤镜的连续曝光段内。
+  clampStepsSplit() {
+    for (const {s, a} of splitIntervals(this.plan)) s.start = +a.toFixed(2);
+  }
+
+  // 调整两路基础时长：相关步骤按各自比例同步（软段步骤随 t_soft
+  // 缩放，硬段步骤相对换片点随 t_hard 缩放），保持落在各自段内。
+  applySplitTimes(ns, nh, immediate = true) {
+    const sp = this.plan.split;
+    const [os, oh] = splitTimes(this.plan);
+    ns = clamp(+ns || os, 0.2, 600);
+    nh = clamp(+nh || oh, 0.2, 600);
+    const oldSwap = splitSegments(this.plan)[0][2];
+    const ks = ns / os, kh = nh / oh;
+    const newSwap = oldSwap * ks;   // 软段整体按比例伸缩后的换片点
+    for (const s of this.plan.steps) {
+      if (stepFilter(s) === 'soft') {
+        s.start = +((+s.start || 0) * ks).toFixed(2);
+      } else {
+        s.start = +(newSwap + ((+s.start || 0) - oldSwap) * kh).toFixed(2);
+      }
+    }
+    sp.t_soft = +ns.toFixed(2);
+    sp.t_hard = +nh.toFixed(2);
+    this.clampSteps();
+    this.syncSplitInputs();
+    this.drawCurveSplit();
+    this.recompute(immediate);
+    this.mark();
+  }
+
+  // 传给引擎的完整校准：分级模式附带两路滤镜曲线
+  calFull() {
+    if (!this.splitMode()) return this.cal;
+    return {...this.cal,
+            split: {soft: this.calS.soft, hard: this.calS.hard}};
+  }
+
   // ------------------------------------------------------------ 计算
   recompute(immediate = false) {
     const run = () => {
       if (!this.baseGray) return;
       this.res = compute(this.baseGray, this.W, this.H, this.plan,
-                         this.cal, this.maskCache, this.scrubT);
+                         this.calFull(), this.maskCache, this.scrubT);
       this.scheduleDraw();
       this.renderWarnings();
       this.renderTimeline();

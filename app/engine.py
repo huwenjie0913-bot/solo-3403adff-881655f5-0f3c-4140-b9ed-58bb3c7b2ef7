@@ -179,32 +179,54 @@ def split_times(plan):
     return t_soft, t_hard
 
 
+def split_layout(plan):
+    """分级滤镜时间轴布局。
+    软段从 0 开始，基础曝光 t_soft，段尾延伸至最迟的软步骤
+    （加光追加会延长该滤镜的连续曝光时段）；换片节点 = 软段结束；
+    硬段从换片点开始，同样为基础 t_hard 加步骤延伸。
+    返回 (segments, intervals, swap_t)：
+      segments  [(filter, seg0, seg1)]，intervals  [(step, filter, a, b)]。
+    遮挡被钳在所属段的基础窗口内，加光钳到段首之后，
+    因此每个步骤始终落在所属滤镜的连续曝光段内。"""
+    t_soft, t_hard = split_times(plan)
+
+    def mk(s, f, seg0, t_base):
+        if s.get("type") == "dodge":
+            dur = t_base * min(1.0, max(0.0, float(s.get("ratio", 0))))
+            a = min(max(float(s.get("start", seg0)), seg0),
+                    seg0 + t_base - dur)
+            return (s, f, a, a + dur)
+        dur = t_base * (2.0 ** float(s.get("stops", 0)) - 1.0)
+        a = max(float(s.get("start", seg0 + t_base)), seg0)
+        return (s, f, a, a + dur)
+
+    intervals = []
+    soft_end = t_soft
+    for s in _steps(plan):
+        if step_filter(s) != "soft":
+            continue
+        iv = mk(s, "soft", 0.0, t_soft)
+        intervals.append(iv)
+        soft_end = max(soft_end, iv[3])
+    hard_end = soft_end + t_hard
+    for s in _steps(plan):
+        if step_filter(s) != "hard":
+            continue
+        iv = mk(s, "hard", soft_end, t_hard)
+        intervals.append(iv)
+        hard_end = max(hard_end, iv[3])
+    segments = [("soft", 0.0, soft_end), ("hard", soft_end, hard_end)]
+    return segments, intervals, soft_end
+
+
 def split_segments(plan):
     """两个连续曝光段：(滤镜, 段首, 段尾)。换片节点 = 软段结束。"""
-    t_soft, t_hard = split_times(plan)
-    return [("soft", 0.0, t_soft), ("hard", t_soft, t_soft + t_hard)]
+    return split_layout(plan)[0]
 
 
 def split_intervals(plan):
-    """展开 split 模式步骤区间为 (step, filter, a, b)。
-    每段相当于一次独立基础曝光：遮挡时长 = ratio×段长，
-    加光追加 = 段长×(2^stops − 1)。步骤被约束在各自滤镜段内
-    （加光允许越过段尾——软段越界即跨越换片，由检测提示）。"""
-    segs = dict((f, (a, b)) for f, a, b in split_segments(plan))
-    out = []
-    for s in _steps(plan):
-        f = step_filter(s)
-        seg0, seg1 = segs[f]
-        t_seg = max(seg1 - seg0, 0.01)
-        if s.get("type") == "dodge":
-            dur = t_seg * min(1.0, max(0.0, float(s.get("ratio", 0))))
-            a = min(max(float(s.get("start", seg0)), seg0), seg0 + t_seg - dur)
-            out.append((s, f, a, a + dur))
-        elif s.get("type") == "burn":
-            dur = t_seg * (2.0 ** float(s.get("stops", 0)) - 1.0)
-            a = max(float(s.get("start", seg1)), seg0)
-            out.append((s, f, a, a + dur))
-    return out
+    """展开 split 模式步骤区间为 (step, filter, a, b)，见 split_layout。"""
+    return split_layout(plan)[1]
 
 
 # ---------------------------------------------------------------- LUT
@@ -386,12 +408,12 @@ def compute_split(base_gray, plan, cal, ref_size=1000):
     # 净密度恰为 base_gray 对应密度 − Dmin，保持与单曲线模式一致）
     x_pix = _invert_x(base_gray, ps).astype(np.float64)
 
-    # 两路曝光能量（段基础曝光为 1，步骤按段长归一增减）
+    # 两路曝光能量（段基础曝光为 1，步骤按段基础时长归一增减）
     mult_s = np.ones((H, W), dtype=np.float64)
     mult_h = np.ones((H, W), dtype=np.float64)
     masks = {}
     scale = ref_size / max(H, W)
-    intervals = split_intervals(plan)
+    segments, intervals, swap_t = split_layout(plan)
     for s, f, a, b in intervals:
         rid = s.get("region_id")
         region = _find_region(plan, rid)
@@ -432,9 +454,9 @@ def compute_split(base_gray, plan, cal, ref_size=1000):
         "intervals": [(s.get("id"), s.get("type"), round(a, 3), round(b, 3), f)
                       for s, f, a, b in intervals],
         "segments": [(f, round(a, 3), round(b, 3))
-                     for f, a, b in split_segments(plan)],
-        "swap_t": t_soft,
-        "timeline_end": max([t_soft + t_hard] + [b for _, _, _, b in intervals]),
+                     for f, a, b in segments],
+        "swap_t": swap_t,
+        "timeline_end": segments[1][2],
         "warnings": [],
     }
     result["warnings"] = detect_warnings_split(
@@ -751,13 +773,15 @@ def detect_warnings_split(result, plan, cal, cal_soft, cal_hard, scale,
         if t and t.get("gray") is not None:
             xi = min(W - 1, max(0, int(round(float(t["x"]) * W))))
             yi = min(H - 1, max(0, int(round(float(t["y"]) * H))))
-            # 目标点处的两路能量系数（由当前步骤布局决定）
+            # 目标点处的两路能量系数（由当前步骤布局决定；
+            # 与 compute_split 一致，按段基础时长归一）
+            t_soft, t_hard = split_times(plan)
             m_s = m_h = 1.0
             for s, f, a, b in intervals:
                 cov = result["masks"].get(s.get("region_id"))
                 if cov is None:
                     continue
-                t_seg = segs[f][1] - segs[f][0]
+                t_seg = t_soft if f == "soft" else t_hard
                 d = max(0.0, (b - a) / max(t_seg, 0.01)) * float(cov[yi, xi])
                 if f == "soft":
                     m_s += -d if s["type"] == "dodge" else d

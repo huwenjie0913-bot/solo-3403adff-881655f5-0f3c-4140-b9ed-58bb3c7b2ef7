@@ -294,13 +294,12 @@ def _stopwatch_nodes(plan, intervals, total):
 
 
 def _stopwatch_nodes_split(plan, total):
-    """分级滤镜秒表：两个连续曝光段 + 换片节点。"""
-    t_soft, t_hard = engine.split_times(plan)
-    segs = dict((f, (a, b)) for f, a, b in engine.split_segments(plan))
+    """分级滤镜秒表：两个连续曝光段 + 换片节点（软段实际结束时）。"""
+    segments, intervals, swap_t = engine.split_layout(plan)
     regions = {r["id"]: r for r in plan.get("regions", [])}
     nodes = [(0.0, "装上低反差滤镜（#00），开始第一段曝光（镜头下全部区域）")]
     acts = []
-    for s, f, a, b in engine.split_intervals(plan):
+    for s, f, a, b in intervals:
         reg = regions.get(s.get("region_id"), {})
         nm = reg.get("name", "未命名区域")
         dur = b - a
@@ -316,7 +315,7 @@ def _stopwatch_nodes_split(plan, total):
         seg = "低反差段" if f == "soft" else "高反差段"
         nodes.append((round(a, 1), f"[{seg}] " + text + " —— 开始"))
         nodes.append((round(b, 1), f"[{seg}] " + text + " —— 结束"))
-    nodes.append((round(t_soft, 1),
+    nodes.append((round(swap_t, 1),
                   "换片：取下低反差滤镜（#00），装上高反差滤镜（#5），"
                   "开始第二段曝光"))
     nodes.append((round(total, 1), "结束 / 移开相纸"))
@@ -378,9 +377,9 @@ def print_sheet(pid):
                          "end": b})
         t_soft, t_hard = engine.split_times(plan)
         split_info = {
-            "t_soft": t_soft, "t_hard": t_hard, "swap_t": t_soft,
+            "t_soft": t_soft, "t_hard": t_hard, "swap_t": res["swap_t"],
             "end": res["timeline_end"],
-            "segments": engine.split_segments(plan),
+            "segments": res["segments"],
         }
     else:
         split_info = None
@@ -435,9 +434,11 @@ def export_json(pid):
         "exported_at": db.now(),
     }
     if engine.split_enabled(plan):
+        t_soft, t_hard = engine.split_times(plan)
         payload["split"] = {
-            "t_soft": res["swap_t"],
-            "t_hard": engine.split_times(plan)[1],
+            "t_soft": t_soft,
+            "t_hard": t_hard,
+            "swap_t": res["swap_t"],
             "segments": res["segments"],
             "timeline_end": res["timeline_end"],
         }
